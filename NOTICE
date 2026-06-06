@@ -1,0 +1,13 @@
+srev — a terminal code reviewer specialized for AI-generated diffs
+Copyright (c) 2026 srev contributors
+
+This product is dual-licensed under either of
+
+  * MIT license       (LICENSE-MIT)
+  * Apache License 2.0 (LICENSE-APACHE)
+
+at your option.
+
+This product bundles and links third-party software. See THIRD-PARTY-NOTICES
+for the licenses and attributions of those components, including statically
+linked native libraries (libgit2) and bundled tree-sitter grammars/themes.

@@ -1,0 +1,30 @@
+# cargo-deny policy. Run: cargo deny check licenses advisories
+# https://embarkstudios.github.io/cargo-deny/
+
+[licenses]
+# Allowed SPDX license identifiers for the dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unlicense",
+    "MPL-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+# libgit2 is linked via libgit2-sys (vendored). Its GPLv2-with-linking-exception
+# applies to the C library, not to Rust crate metadata; reviewed in
+# THIRD-PARTY-NOTICES.md.
+
+[advisories]
+yanked = "warn"
+
+[bans]
+multiple-versions = "allow"
