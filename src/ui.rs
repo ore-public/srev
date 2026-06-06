@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use crate::app::{
     App, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, SelRegion, ViewMode,
 };
+use crate::diffview::LineMark;
 use crate::finder::Finder;
 use crate::git::FileStatus;
 use crate::tree::Row;
@@ -303,6 +304,27 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// 変更行の背景色（追加=緑系, 変更=青系）。削除印は行自体は変わらないので無し。
+/// 暗い端末でもはっきり分かる濃さにする。
+fn change_line_bg(mark: LineMark) -> Option<Color> {
+    match mark {
+        LineMark::Added => Some(Color::Rgb(20, 44, 28)),
+        LineMark::Modified => Some(Color::Rgb(26, 34, 58)),
+        LineMark::None | LineMark::DeletedAbove => None,
+    }
+}
+
+/// 変更印の gutter マーカー（追加=緑, 変更=青, 削除あり=赤）。
+fn change_marker(mark: LineMark) -> Span<'static> {
+    let (ch, color) = match mark {
+        LineMark::Added => ("▌", Color::Green),
+        LineMark::Modified => ("▌", Color::Blue),
+        LineMark::DeletedAbove => ("▔", Color::Red),
+        LineMark::None => (" ", Color::Reset),
+    };
+    Span::styled(ch, Style::default().fg(color))
+}
+
 fn render_code(
     frame: &mut Frame,
     area: Rect,
@@ -323,6 +345,13 @@ fn render_code(
         .skip(open.scroll)
         .take(height)
         .map(|(i, line)| {
+            // 変更印（HEAD との差分）をエディタ風に gutter 左端へ。
+            let mark = open
+                .change_marks
+                .get(i)
+                .copied()
+                .unwrap_or(LineMark::None);
+            let marker = change_marker(mark);
             let gutter = Span::styled(
                 format!("{:>num_width$} ", i + 1),
                 Style::default().fg(Color::DarkGray),
@@ -330,7 +359,8 @@ fn render_code(
             let line_len = open.raw_lines.get(i).map_or(0, |l| l.chars().count());
             let line_sel = sel.and_then(|r| line_selection(r, i, line_len));
 
-            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            let mut spans = Vec::with_capacity(line.spans.len() + 2);
+            spans.push(marker);
             spans.push(gutter);
             // 選択範囲があれば該当セルに選択背景を載せる。
             if let Some((s, e, _)) = line_sel {
@@ -340,7 +370,7 @@ fn render_code(
             }
             let mut out = Line::from(spans);
 
-            // 行全体の背景（選択フィル > 現在行 > 検索マッチ）。
+            // 行全体の背景（選択フィル > 現在行 > 検索マッチ > 変更行の薄い色）。
             let is_match = search_lc.as_ref().is_some_and(|q| {
                 open.raw_lines.get(i).is_some_and(|l| l.to_lowercase().contains(q))
             });
@@ -350,6 +380,8 @@ fn render_code(
                 out = out.style(Style::default().bg(CURSOR_LINE_BG));
             } else if is_match {
                 out = out.style(Style::default().bg(MATCH_LINE_BG));
+            } else if let Some(bg) = change_line_bg(mark) {
+                out = out.style(Style::default().bg(bg));
             }
             out
         })
@@ -466,7 +498,8 @@ fn place_cursor(frame: &mut Frame, content_area: Rect, app: &App) {
         return;
     }
     let num_width = open.lines.len().to_string().len().max(3);
-    let gutter = num_width as u16 + 1;
+    // 変更印マーカー(1) + 行番号(num_width) + スペース(1)。
+    let gutter = num_width as u16 + 2;
     let x = inner_x + gutter + open.cursor_col.min(u16::MAX as usize) as u16;
     let y = inner_y + (open.cursor_line - open.scroll) as u16;
     let max_x = content_area.x + content_area.width.saturating_sub(2);

@@ -22,6 +22,7 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Syntax highlighting** for 70+ languages via inkjet / tree-sitter — **Markdown also highlights code inside fenced blocks** per language
 - **Diff review navigation** — jump between hunks with `n`/`N`, between changed files with `]`/`[`. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
 - File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked) respecting `.gitignore`
+- **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD
 - Single binary. Builds on Linux / macOS / Windows
 
 ---

@@ -132,6 +132,8 @@ pub struct OpenFile {
     /// このファイルのシンボル定義一覧（アウトライン）。
     pub outline: Vec<Symbol>,
     pub outline_selected: usize,
+    /// 各行の変更印（HEAD との差分、コードビューの gutter 用）。
+    pub change_marks: Vec<crate::diffview::LineMark>,
 }
 
 impl OpenFile {
@@ -1317,6 +1319,12 @@ impl App {
             self.view_mode = ViewMode::Code;
         }
 
+        // コードビューの gutter 用に、行ごとの変更印を計算しておく。
+        let change_marks = diff
+            .as_ref()
+            .map(|d| d.line_marks(lines.len()))
+            .unwrap_or_default();
+
         self.selection = None;
         self.open = Some(OpenFile {
             path: path.to_path_buf(),
@@ -1329,6 +1337,7 @@ impl App {
             cursor_col: 0,
             outline,
             outline_selected: 0,
+            change_marks,
         });
         // 左ペイン（ツリー／変更ファイル一覧）の選択を開いたファイルに同期する。
         self.tree.reveal(path);
@@ -1481,6 +1490,7 @@ mod tests {
             cursor_col: 0,
             outline: Vec::new(),
             outline_selected: 0,
+            change_marks: Vec::new(),
         }
     }
 
@@ -1594,6 +1604,62 @@ mod tests {
             linewise: true,
         };
         assert_eq!(extract_selection(&raw, &r), "abcdef\nghijkl");
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git").args(args).current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status().unwrap().success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn change_marker_renders_for_modified_line() {
+        use crate::diffview::LineMark;
+        let dir = std::env::temp_dir().join(format!("srev_mark_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("code.rs"), "fn a() {}
+fn b() {}
+fn c() {}
+").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-q", "-m", "first"]);
+        // 2行目を変更
+        std::fs::write(dir.join("code.rs"), "fn a() {}
+fn B() {}
+fn c() {}
+").unwrap();
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        let path = dir.join("code.rs");
+        app.open_file(&path);
+        let marks = &app.open.as_ref().unwrap().change_marks;
+        assert!(marks.iter().any(|m| *m != LineMark::None), "marks not computed: {marks:?}");
+
+        // 実際に描画してマーカー文字＋変更行の背景が出るか
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        // gutter マーカー（▌/▔）
+        let has_marker = buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "\u{258c}" || c.symbol() == "\u{2594}");
+        // 変更行（2行目=Modified）は行全体に Modified 背景色が乗る。
+        let modbg = ratatui::style::Color::Rgb(26, 34, 58);
+        let mut max_run = 0;
+        for y in 0..buf.area.height {
+            let run = (0..buf.area.width).filter(|&x| buf[(x, y)].bg == modbg).count();
+            max_run = max_run.max(run);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(has_marker, "no change marker rendered");
+        assert!(max_run >= 10, "changed-line background not filled (max run = {max_run})");
     }
 
     #[test]

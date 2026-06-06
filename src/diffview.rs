@@ -35,7 +35,63 @@ pub struct SplitRow {
     pub right: Line<'static>,
 }
 
+/// コードビューの gutter に出す行ごとの変更印（エディタ風）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineMark {
+    None,
+    Added,
+    Modified,
+    /// この行の直前で行が削除された。
+    DeletedAbove,
+}
+
 impl DiffRender {
+    /// 新ファイル各行の変更印を返す（コードビューの gutter 用）。
+    /// `total` は新ファイルの行数。
+    pub fn line_marks(&self, total: usize) -> Vec<LineMark> {
+        let mut marks = vec![LineMark::None; total];
+        let mut pending_del = 0usize; // まだ追加と対にしていない削除数
+        let set = |marks: &mut [LineMark], lineno: Option<u32>, m: LineMark| {
+            if let Some(n) = lineno {
+                let idx = (n as usize).saturating_sub(1);
+                if idx < marks.len() && marks[idx] == LineMark::None {
+                    marks[idx] = m;
+                }
+            }
+        };
+        for dl in &self.raw {
+            match dl.kind {
+                DiffKind::Hunk => pending_del = 0,
+                DiffKind::Del => pending_del += 1,
+                DiffKind::Add => {
+                    let m = if pending_del > 0 {
+                        LineMark::Modified // 削除を伴う追加＝変更
+                    } else {
+                        LineMark::Added
+                    };
+                    if let Some(n) = dl.new_lineno {
+                        let idx = (n as usize).saturating_sub(1);
+                        if idx < marks.len() {
+                            marks[idx] = m;
+                        }
+                    }
+                    pending_del = pending_del.saturating_sub(1);
+                }
+                DiffKind::Context => {
+                    if pending_del > 0 {
+                        set(&mut marks, dl.new_lineno, LineMark::DeletedAbove);
+                        pending_del = 0;
+                    }
+                }
+            }
+        }
+        // EOF での純削除は最終行に印を付ける。
+        if pending_del > 0 && total > 0 && marks[total - 1] == LineMark::None {
+            marks[total - 1] = LineMark::DeletedAbove;
+        }
+        marks
+    }
+
     /// side-by-side 行を必要時に構築してキャッシュする。
     pub fn ensure_split(
         &mut self,
@@ -325,6 +381,31 @@ mod tests {
         r.ensure_split(&code, &mut h);
         assert!(r.split_rows().is_some());
         assert_eq!(r.row_count(true), r.split_rows().unwrap().len());
+    }
+
+    #[test]
+    fn line_marks_classify_add_modify_delete() {
+        let mut h = CodeHighlighter::new();
+        let code = vec![
+            Line::from("ctx"),
+            Line::from("added"),
+            Line::from("modified"),
+            Line::from("ctx2"),
+        ];
+        let diff = vec![
+            dl(DiffKind::Context, Some(1), Some(1), "ctx"),
+            dl(DiffKind::Add, None, Some(2), "added"), // 純追加
+            dl(DiffKind::Del, Some(2), None, "old"),
+            dl(DiffKind::Add, None, Some(3), "modified"), // 削除を伴う追加=変更
+            dl(DiffKind::Del, Some(3), None, "removed"),  // 純削除（4行目の上）
+            dl(DiffKind::Context, Some(4), Some(4), "ctx2"),
+        ];
+        let r = build(&diff, &code, &mut h, Syntax::Lang(Language::Plaintext));
+        let marks = r.line_marks(4);
+        assert_eq!(marks[0], LineMark::None);
+        assert_eq!(marks[1], LineMark::Added);
+        assert_eq!(marks[2], LineMark::Modified);
+        assert_eq!(marks[3], LineMark::DeletedAbove);
     }
 
     #[test]
