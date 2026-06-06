@@ -1,12 +1,12 @@
 [package]
 name = "srev"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A terminal code and diff viewer specialized for reading code"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 readme = "README.md"
-repository = "https://github.com/mkonishi1981/srev"
+repository = "https://github.com/ore-public/srev"
 keywords = ["tui", "git", "diff", "code-review", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
 

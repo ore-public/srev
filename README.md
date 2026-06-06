@@ -1,271 +1,284 @@
 # srev — source reviewer
 
-**日本語** | [English](README.en.md)
+[日本語](README.ja.md) | **English**
 
-コードを「読む」ことに特化したターミナル TUI ビューワーです。
-差分の確認とフルファイルの閲覧に集中できるよう、操作をシンプルにまとめています。編集機能はありません。
-
----
-
-## 特長
-
-- **作業ツリー vs HEAD の差分**を `d` で表示（未コミットの変更をレビュー）
-- **差分 ⇄ フルコードのトグル**（`d`）。見ている行を保持したまま相互にジャンプ
-- **vim ライクなカーソル**でコードを読み、カーソル下の語から**定義へジャンプ**（`gd`）
-- **visual mode**（`v`/`V`）で範囲選択し、`y` でクリップボードへコピー
-- **左下アウトラインペイン**にシンボル一覧を表示して定義へ移動できる
-- **ファイル内検索**（`/` → `Enter`、`n`/`N` で前後のマッチへ）
-- **あいまいファイル検索**（`Ctrl-P`、nucleo = fzf 相当）
-- **プロジェクト全体の本文検索**（`Ctrl-F`、部分一致・大文字小文字無視）でマッチ行へジャンプ
-- **ツリー / アウトライン / オーバーレイの `/`** で入力しながら候補を絞り込み
-- **`Ctrl-R` でリロード**（開いているファイル・git 状態・ツリー・索引、カーソル位置保持）
-- **多言語シンタックスハイライト**（inkjet / tree-sitter、70+ 言語）。**Markdown はコードフェンス内の言語別ハイライトにも対応**
-- **差分レビュー操作**：`n`/`N` で hunk 間ジャンプ、`]`/`[` で変更ファイル間を移動。差分は**既定で左右（side-by-side）**表示（新規/削除ファイルは自動で単一表示）、`s` で単一表示と切替
-- ファイルツリーに変更ステータスを表示（`M`=変更 / `A`=追加 / `D`=削除 / `?`=未追跡、`.gitignore` 準拠）
-- **コードビューでも HEAD との変更行を gutter に表示**（追加=緑 / 変更=青 / 直前に削除あり=赤、エディタ風）
-- 単一バイナリ。Linux / macOS / Windows でビルド可能
+A terminal TUI viewer specialized for *reading* code without opening an editor.
+It keeps the controls simple so you can focus on reviewing diffs and browsing full files. No editing features.
 
 ---
 
-## インストール / ビルド
+## Features
 
-現時点ではソースからのビルドのみです。Rust ツールチェーンと **C コンパイラ**が必要です
-（libgit2 と tree-sitter 文法のビルドに使用）。
+- **Working tree vs HEAD diff** on demand with `d` — review uncommitted changes
+- **Toggle diff ⇄ full code** with `d`, preserving the corresponding line position
+- **Vim-like cursor** for reading code; **jump to definition** under cursor with `gd`
+- **Visual mode** (`v`/`V`) to select a range, then `y` to copy to clipboard
+- **Outline pane** (bottom-left) lists symbols in the open file for quick navigation
+- **In-file search** (`/` → `Enter`, `n`/`N` for next/previous match)
+- **Fuzzy file search** (`Ctrl-P`, powered by nucleo — fzf equivalent)
+- **Project-wide content search** (`Ctrl-F`, case-insensitive substring) — jump to a matching line
+- **Inline fuzzy filtering** with `/` in tree, outline, and overlay panels
+- **`Ctrl-R` reload** — re-reads the open file, git state, tree, and index while keeping cursor position
+- **Syntax highlighting** for 70+ languages via inkjet / tree-sitter — **Markdown also highlights code inside fenced blocks** per language
+- **Diff review navigation** — jump between hunks with `n`/`N`, between changed files with `]`/`[`. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
+- File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked) respecting `.gitignore`
+- **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD
+- Single binary. Builds on Linux / macOS / Windows
+
+---
+
+## Installation
+
+You need a Rust toolchain (`cargo`) and a **C compiler** (required to build
+libgit2 and tree-sitter grammars). The first build takes a few minutes and the
+binary is about 80 MB because grammar files are bundled.
+
+### From crates.io (recommended)
 
 ```sh
-git clone https://github.com/mkonishi1981/srev
+cargo install srev
+```
+
+### From GitHub (latest development version)
+
+```sh
+cargo install --git https://github.com/ore-public/srev
+```
+
+Either way the binary is installed to `~/.cargo/bin/srev` (run it as `srev` if
+that directory is on your `$PATH`).
+
+### Build from source (for development)
+
+```sh
+git clone https://github.com/ore-public/srev
 cd srev
-cargo build --release   # 出力: target/release/srev
-cargo test              # ユニットテスト一式
+cargo build --release   # output: target/release/srev
+cargo test              # run unit tests
 ```
-
-bundled された文法ファイルを含むため、release バイナリは約 80 MB になります。
-ビルド済みバイナリを `$PATH` の通った場所に置けば `srev` として起動できます。
 
 ---
 
-## 使い方
+## Usage
 
-### 起動
+### Launching
 
 ```sh
-srev [PATH]   # PATH 省略時はカレントディレクトリ
+srev [PATH]   # defaults to the current directory if PATH is omitted
 ```
 
-- 起動時は**コードモード**（ファイルツリー閲覧）です。`d` で差分（作業ツリー vs HEAD）に切り替えます。
+- Starts in **code mode** (file tree browsing). Press `d` to switch to diff (working tree vs HEAD).
 
-### 画面構成
+### Layout
 
 ```
 ┌──────────────┬──────────────────────────────┐
-│ ファイルツリー │                              │
-│（コードモード）│         本文                  │
-│  変更ファイル  │   （コード または 差分）        │
-│（差分モード）  │                              │
+│  File tree   │                              │
+│ (code mode)  │         Content              │
+│  Changed     │   (code  or  diff)           │
+│  files       │                              │
+│ (diff mode)  │                              │
 ├──────────────┤                              │
-│  アウトライン  │                              │
+│  Outline     │                              │
 │  (Symbols)   │                              │
 └──────────────┴──────────────────────────────┘
-                  ステータス / ヘルプ行
+                  Status / help bar
 ```
 
-- **左上**：コードモード時はファイルツリー、差分モード時は変更ファイル一覧
-- **左下**：開いているファイルのシンボル一覧（Symbols）
-- **右**：本文（コードまたは unified diff）
-- **下部**：ステータス行とキーヒント
+- **Top-left**: file tree (code mode) or changed-file list (diff mode)
+- **Bottom-left**: symbol list for the open file (Outline / Symbols)
+- **Right**: content pane — code or unified diff
+- **Bottom bar**: status and key hints
 
-`d` キーでコード ⇄ 差分をトグルできます（見ている行に対応する位置を保持）。
+Press `d` to toggle between code and diff, keeping the current line in view.
 
-### キーバインド
+### Key Bindings
 
-#### 共通
+#### Global
 
-| キー | 動作 |
-|------|------|
-| `q` | 終了 |
-| `Tab` | フォーカス巡回（ツリー → アウトライン → 本文） |
-| `d` | 差分 ⇄ コードを切替（見ている行を保持） |
-| `Ctrl-P` | ファイル名あいまい検索オーバーレイを開く |
-| `Ctrl-F` | プロジェクト全体の本文検索（部分一致）。`Enter` で該当行へジャンプ |
-| `Ctrl-R` | リロード（ファイル・git 状態・ツリー・索引を再読込、カーソル位置保持） |
-| `]` / `[` | 次 / 前のファイルを開く（コードモード=全ファイル昇順、差分モード=変更ファイル） |
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `Tab` | Cycle focus (tree → outline → content) |
+| `d` | Toggle diff ⇄ code (line position preserved) |
+| `Ctrl-P` | Open fuzzy file search overlay |
+| `Ctrl-F` | Project-wide content search (substring); `Enter` jumps to the matching line |
+| `Ctrl-R` | Reload (file, git state, tree, index — cursor kept) |
+| `]` / `[` | Open next / previous file (code mode = all files by path; diff mode = changed files) |
 
-#### ツリー（コードモード）/ 変更ファイル一覧（差分モード）
+#### Tree (code mode) / Changed-file list (diff mode)
 
-| キー | 動作 |
-|------|------|
-| `j` / `k`、`↓` / `↑` | 移動 |
-| `Enter` / `l` | ファイルを開く / ディレクトリを展開 |
-| `h` | ディレクトリを畳む（ツリー時のみ） |
-| `/` | インラインあいまい絞り込み |
+| Key | Action |
+|-----|--------|
+| `j` / `k`, `↓` / `↑` | Move up/down |
+| `Enter` / `l` | Open file / expand directory |
+| `h` | Collapse directory (tree only) |
+| `/` | Inline fuzzy filter |
 
-#### アウトライン（左下）
+#### Outline (bottom-left)
 
-| キー | 動作 |
-|------|------|
-| `j` / `k` | シンボル選択 |
-| `Enter` / `l` | その定義行へカーソル移動 |
-| `/` | シンボルを絞り込み |
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Select symbol |
+| `Enter` / `l` | Jump to definition line |
+| `/` | Filter symbols |
 
-#### 本文（コードモード）
+#### Content pane — code mode (vim-like)
 
-| キー | 動作 |
-|------|------|
-| `h` / `j` / `k` / `l` | カーソル移動 |
-| `w` / `b` | 単語単位で前後（行内のみ） |
-| `0` / `$` | 行頭 / 行末 |
-| `gg` / `G` | ファイル先頭 / 末尾 |
-| `Ctrl-d` / `Ctrl-u` | 半画面スクロール |
-| `gd` | カーソル下の語の定義へジャンプ |
-| `v` / `V` | visual mode 開始（文字単位 / 行単位） |
-| `y` | 選択範囲をクリップボードへコピー |
-| `Y` | 位置情報をコピー（選択なし=`パス:行:列`／単一行選択=`パス:行`／複数行選択=`パス:開始行-終了行`） |
-| `Esc` | 選択解除 |
-| `/` → 入力 → `Enter` | ファイル内検索 |
-| `n` / `N` | 次 / 前のマッチへ |
+| Key | Action |
+|-----|--------|
+| `h` / `j` / `k` / `l` | Move cursor |
+| `w` / `b` | Word forward/back (within line) |
+| `0` / `$` | Line start / end |
+| `gg` / `G` | File start / end |
+| `Ctrl-d` / `Ctrl-u` | Half-page scroll |
+| `gd` | Jump to definition of word under cursor |
+| `v` / `V` | Start visual mode (character / line) |
+| `y` | Copy selection to clipboard |
+| `Y` | Copy location to clipboard (no selection = `path:line:col`; single-line = `path:line`; multi-line = `path:start-end`) |
+| `Esc` | Cancel selection |
+| `/` → type → `Enter` | In-file search |
+| `n` / `N` | Next / previous match |
 
-> `gg` と `gd` の `g` プレフィックスは固定で、設定ファイルによる変更対象外です。
+> The `g` prefix for `gg` and `gd` is fixed and cannot be remapped in the config file.
 
-#### 本文（差分モード）
+#### Content pane — diff mode
 
-| キー | 動作 |
-|------|------|
-| `j` / `k` | スクロール |
-| `gg` / `G` | 先頭 / 末尾へ |
-| `PageDown` / `PageUp` | ページスクロール |
-| `n` / `N` | 次 / 前の hunk（変更ブロック）へジャンプ |
-| `s` | side-by-side ⇄ unified の切替（既定は side-by-side。新規/削除ファイルは自動で単一表示） |
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Scroll |
+| `gg` / `G` | Jump to start / end |
+| `PageDown` / `PageUp` | Page scroll |
+| `n` / `N` | Jump to next / previous hunk (change block) |
+| `s` | Toggle side-by-side ⇄ unified (default is side-by-side; new/deleted files show as single column) |
 
-#### オーバーレイ / フィルタ / 検索入力中
+#### Overlay / filter / search input
 
-| キー | 動作 |
-|------|------|
-| `Esc` | 取消・閉じる |
-| `Enter` | 確定 |
-| `Backspace` | 入力を編集 |
-| `↑` / `↓` または `Ctrl-p` / `Ctrl-n` | 候補を上下移動 |
+| Key | Action |
+|-----|--------|
+| `Esc` | Cancel / close |
+| `Enter` | Confirm |
+| `Backspace` | Edit input |
+| `↑` / `↓` or `Ctrl-p` / `Ctrl-n` | Move through candidates |
 
-> `Ctrl-p` / `Ctrl-n` による候補移動は**フィルタ・オーバーレイ入力中のみ**有効です。
-> 通常モードの `Ctrl-P`（大文字）はファイル検索オーバーレイを開くキーです。
+> `Ctrl-p` / `Ctrl-n` for candidate navigation is active **only while a filter or overlay is open**.
+> In normal mode, `Ctrl-P` opens the fuzzy file search overlay.
 
 ---
 
-## 設定
+## Configuration
 
-### キーバインドの変更
+### Remapping Keys
 
-設定ファイル: `~/.config/srev/config.toml`（`SREV_CONFIG` 環境変数で別パスを指定可）
+Config file: `~/.config/srev/config.toml`
+(Override the path with the `SREV_CONFIG` environment variable.)
 
-`[keys]` テーブルに `"キー" = "アクション名"` を記述します。
+Add entries under `[keys]` as `"key" = "action"`.
 
 ```toml
 [keys]
 "ctrl-r" = "reload"
-"x"      = "toggle_diff"   # 別キーを割り当て
-"d"      = "none"          # 既定の d を無効化
+"x"      = "toggle_diff"   # bind to a different key
+"d"      = "none"          # disable the default d binding
 ```
 
-### キー表記
+### Key Notation
 
-| 種類 | 例 |
-|------|----|
-| 単一文字 | `"a"`, `"/"`, `"$"` |
-| Ctrl 修飾 | `"ctrl-p"`, `"ctrl-r"` |
-| 大文字 | `"Y"`, `"G"`, `"N"` |
-| 特殊キー名 | `tab`, `enter`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `backspace`, `del` |
+| Type | Examples |
+|------|---------|
+| Single character | `"a"`, `"/"`, `"$"` |
+| Ctrl modifier | `"ctrl-p"`, `"ctrl-r"` |
+| Uppercase | `"Y"`, `"G"`, `"N"` |
+| Named keys | `tab`, `enter`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `backspace`, `del` |
 
-### アクション名一覧
+### Action Names
 
-| アクション名 | 説明 |
-|-------------|------|
-| `quit` | 終了 |
-| `focus_next` | フォーカス巡回 |
-| `down` | 下移動 |
-| `up` | 上移動 |
-| `left` | 左移動 / ディレクトリを畳む |
-| `right` | 右移動 / 開く |
-| `activate` | 開く / 確定 |
-| `top` | 先頭へ（`gg` 相当） |
-| `bottom` | 末尾へ（`G` 相当） |
-| `half_page_down` | 半画面下スクロール |
-| `half_page_up` | 半画面上スクロール |
-| `word_forward` | 単語前進 |
-| `word_back` | 単語後退 |
-| `line_start` | 行頭 |
-| `line_end` | 行末 |
-| `toggle_diff` | 差分 ⇄ コード切替 |
-| `goto_def` | 定義へジャンプ |
-| `find` | ファイル内検索開始 |
-| `search_next` | 次のマッチ |
-| `search_prev` | 前のマッチ |
-| `visual_char` | 文字単位 visual mode |
-| `visual_line` | 行単位 visual mode |
-| `yank` | 選択をコピー |
-| `yank_location` | 位置をコピー（選択時は行/行範囲） |
-| `fuzzy_find` | ファイル検索オーバーレイ |
-| `reload` | リロード |
-| `cancel` | 選択解除 / キャンセル |
-| `next_file` | 次のファイルを開く（コード=全ファイル / 差分=変更ファイル） |
-| `prev_file` | 前のファイルを開く（コード=全ファイル / 差分=変更ファイル） |
-| `toggle_split` | unified ⇄ side-by-side 切替 |
-| `grep` | プロジェクト全体の本文検索 |
+| Action name | Description |
+|-------------|-------------|
+| `quit` | Quit |
+| `focus_next` | Cycle focus |
+| `down` | Move down |
+| `up` | Move up |
+| `left` | Move left / collapse directory |
+| `right` | Move right / open |
+| `activate` | Open / confirm |
+| `top` | Jump to top (like `gg`) |
+| `bottom` | Jump to bottom (like `G`) |
+| `half_page_down` | Half-page scroll down |
+| `half_page_up` | Half-page scroll up |
+| `word_forward` | Word forward |
+| `word_back` | Word back |
+| `line_start` | Line start |
+| `line_end` | Line end |
+| `toggle_diff` | Toggle diff ⇄ code |
+| `goto_def` | Jump to definition |
+| `find` | Start in-file search |
+| `search_next` | Next match |
+| `search_prev` | Previous match |
+| `visual_char` | Character visual mode |
+| `visual_line` | Line visual mode |
+| `yank` | Copy selection |
+| `yank_location` | Copy location (line / line range when selecting) |
+| `fuzzy_find` | Open file search overlay |
+| `reload` | Reload |
+| `cancel` | Cancel selection / close |
+| `next_file` | Open next file (code = all files; diff = changed files) |
+| `prev_file` | Open previous file (code = all files; diff = changed files) |
+| `toggle_split` | Toggle unified ⇄ side-by-side diff |
+| `grep` | Project-wide content search |
 
-`"none"` を指定するとそのキーを無効化できます。
-`gg` / `gd` の `g` プレフィックスは設定変更の対象外です。
-
----
-
-## 対応言語
-
-### シンタックスハイライト
-
-inkjet（tree-sitter ベース）により **70+ 言語**に対応しています。
-**Markdown** は tree-sitter の block + inline 文法で対応し、コードフェンス
-（```rust など）の中身も対応言語であれば言語別にハイライトします。
-
-### コードジャンプ（`gd`）とアウトライン
-
-Rust / Python / JavaScript / Go / Ruby / C のみ対応しています。
+Use `"none"` to disable a key binding.
+The `g` prefix for `gg` / `gd` cannot be remapped.
 
 ---
 
-## 技術スタック
+## Supported Languages
 
-| 役割 | クレート |
-|------|----------|
-| TUI / 端末抽象 | `ratatui` + `crossterm` |
-| シンタックスハイライト | `inkjet`（tree-sitter ベース、70+ 言語） |
-| あいまい検索 | `nucleo-matcher` |
-| ファイル走査（gitignore 準拠） | `ignore` |
-| git 差分 / 状態 | `git2`（vendored libgit2） |
-| シンボル索引 / 定義ジャンプ | `tree-sitter-tags` |
-| クリップボード | `arboard` |
-| キーマップ設定 | `toml` |
+### Syntax Highlighting
 
----
+**70+ languages** via inkjet (tree-sitter based).
+**Markdown** is supported via tree-sitter's block + inline grammars, and code
+inside fenced blocks (```rust, etc.) is highlighted per language when supported.
 
-## 既知の制限
+### Code Jump (`gd`) and Outline
 
-- **横スクロール未対応**。長い行はカーソルでたどれますが、画面は横にスクロールしません。
-- **side-by-side 表示**では各ペインが画面幅の約半分になるため、長い行はより早くクリップされます。
-  また `s` でのトグル時、スクロール位置は厳密には対応せず近い位置に再表示されます。
-- **`gd` の索引はバックグラウンド構築**。起動直後に作り始めるため、大規模プロジェクトで
-  起動直後に `gd` すると「インデックス構築中…」と表示されることがあります（完了後は即ジャンプ）。
-- **全角文字 / タブを含む行**：カーソルおよび選択ハイライトの表示位置がやや
-  ずれることがあります。
-- **ファイル内検索はマッチ行単位**のハイライトです（行内の位置は強調されません）。
-- **クリップボード（arboard）はローカル環境向け**。SSH 経由での利用では
-  端末クリップボードに届かないことがあります。
+Supported for **Rust, Python, JavaScript, Go, Ruby, C** only.
 
 ---
 
-## ライセンス
+## Tech Stack
 
-このプロジェクトは **MIT OR Apache-2.0** のデュアルライセンスです。
-詳細は [`LICENSE-MIT`](LICENSE-MIT) および [`LICENSE-APACHE`](LICENSE-APACHE) を参照してください。
+| Role | Crate |
+|------|-------|
+| TUI / terminal abstraction | `ratatui` + `crossterm` |
+| Syntax highlighting | `inkjet` (tree-sitter based, 70+ languages) |
+| Fuzzy matching | `nucleo-matcher` |
+| File traversal (gitignore-aware) | `ignore` |
+| Git diff / status | `git2` (vendored libgit2) |
+| Symbol index / definition jump | `tree-sitter-tags` |
+| Clipboard | `arboard` |
+| Keymap config | `toml` |
 
-第三者コンポーネントのライセンスは [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) を参照してください。
-特記すべき点：
+---
 
-- **libgit2**（git2 クレートで vendored 静的リンク）：GPLv2 + linking exception
-- **nucleo-matcher**：MPL-2.0
+## Known Limitations
+
+- **No horizontal scroll** — long lines can be traversed with the cursor, but the view does not pan horizontally.
+- **Side-by-side view** gives each pane about half the screen width, so long lines clip sooner. Toggling with `s` re-shows a nearby position rather than an exact match.
+- **`gd` index builds in the background** — it starts on launch, so on large projects an early `gd` may briefly show "indexing…" (jumps are instant once ready).
+- **Wide characters and tabs** — cursor and selection highlight positions may be slightly off on lines containing full-width characters or tab characters.
+- **In-file search highlights whole lines** — the exact match position within the line is not highlighted.
+- **Clipboard via arboard is for local use** — when connecting over SSH, clipboard content may not reach the remote terminal (consider OSC52 for SSH use cases).
+
+---
+
+## License
+
+This project is dual-licensed under **MIT OR Apache-2.0**.
+See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE) for details.
+
+Third-party component licenses are listed in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+Notable entries:
+
+- **libgit2** (vendored static link via the git2 crate): GPLv2 + linking exception
+- **nucleo-matcher**: MPL-2.0
