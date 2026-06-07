@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::thread;
 
-use ignore::WalkBuilder;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
 /// 抽出された 1 つの定義。
@@ -214,7 +213,7 @@ impl ProjectIndex {
 fn collect_index(root: &Path, configs: &LangConfigs) -> Index {
     let mut defs = Vec::new();
     let mut refs = Vec::new();
-    for entry in WalkBuilder::new(root).build().flatten() {
+    for entry in crate::finder::walker(root).build().flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
             continue;
         }

@@ -12,7 +12,7 @@ use crate::finder::{Finder, collect_files};
 use crate::fuzzy::Fuzzy;
 use crate::git::{FileStatus, GitInfo};
 use crate::grep::ProjectSearch;
-use crate::highlight::{self, CodeHighlighter};
+use crate::highlight::CodeHighlighter;
 use crate::keymap::{Action, Chord, Keymap};
 use crate::tags::{LangConfigs, ProjectIndex, Symbol};
 use crate::tree::Tree;
@@ -282,14 +282,20 @@ pub struct App {
 
 impl App {
     pub fn new(root: PathBuf) -> Self {
-        let tree = Tree::new(&root);
-        let mut all_files = collect_files(&root);
+        let git = GitInfo::discover(&root);
+        // git の無視判定（非 git なら何も無視しない）。
+        let (tree, mut all_files) = {
+            let is_ignored = |p: &Path| git.as_ref().is_some_and(|g| g.is_ignored(p));
+            (
+                Tree::new(&root, &is_ignored),
+                collect_files(&root, &is_ignored),
+            )
+        };
         all_files.sort_by(|a, b| a.rel.cmp(&b.rel)); // [ ] の順送りを安定させる
         let finder = Finder::from_files(all_files.clone());
         let grep = ProjectSearch::new(&all_files);
         let mut index = ProjectIndex::new(&root);
         index.start(); // 起動直後にバックグラウンド構築を開始
-        let git = GitInfo::discover(&root);
         let statuses = git.as_ref().map(|g| g.statuses()).unwrap_or_default();
         let changed = changed_entries(&statuses, &root);
         Self {
@@ -1481,8 +1487,12 @@ impl App {
         if self.changed_selected >= self.changed.len() {
             self.changed_selected = self.changed.len().saturating_sub(1);
         }
-        self.tree = Tree::new(&self.root);
-        self.all_files = collect_files(&self.root);
+        {
+            let git = self.git.as_ref();
+            let is_ignored = |p: &Path| git.is_some_and(|g| g.is_ignored(p));
+            self.tree = Tree::new(&self.root, &is_ignored);
+            self.all_files = collect_files(&self.root, &is_ignored);
+        }
         self.all_files.sort_by(|a, b| a.rel.cmp(&b.rel));
         self.finder = Finder::from_files(self.all_files.clone());
         self.grep = ProjectSearch::new(&self.all_files);
@@ -1554,7 +1564,7 @@ impl App {
 
     /// ファイルを読み込み、ハイライト・差分・アウトラインを用意して開く。
     fn open_file(&mut self, path: &Path) {
-        let syntax = highlight::detect_syntax(path);
+        let syntax = self.highlighter.detect(path);
         let (lines, raw_lines, outline) = match std::fs::read_to_string(path) {
             Ok(source) => {
                 // CRLF を正規化（カーソル/選択/表示に \r が混ざらないように）。
@@ -2034,6 +2044,22 @@ fn c() {}
         app.show_jumps = false;
         let text2 = buf_text(&mut app);
         assert!(!text2.contains("Jumps"), "jumps pane should be hidden");
+    }
+
+    #[test]
+    fn tree_marks_gitignored_entries() {
+        // 実リポジトリ（.gitignore に /target）で、target が表示されつつ無視色になる。
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let app = App::new(root);
+        let rows = app.tree.rows();
+        let target = rows.iter().find(|r| r.name == "target");
+        assert!(
+            target.is_some_and(|r| r.ignored),
+            "target should be listed and marked ignored"
+        );
+        // 追跡対象（src）は無視色ではない。
+        let src = rows.iter().find(|r| r.name == "src");
+        assert!(src.is_some_and(|r| !r.ignored));
     }
 
     #[test]

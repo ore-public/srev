@@ -21,9 +21,9 @@
 - **プロジェクト全体の本文検索**（`Ctrl-F`、部分一致・大文字小文字無視）でマッチ行へジャンプ
 - **ツリー / アウトライン / オーバーレイの `/`** で入力しながら候補を絞り込み
 - **`Ctrl-R` でリロード**（開いているファイル・git 状態・ツリー・索引、カーソル位置保持）
-- **多言語シンタックスハイライト**（inkjet / tree-sitter、70+ 言語）。**Markdown はコードフェンス内の言語別ハイライトにも対応**
+- **多言語シンタックスハイライト**（syntect、200+ 言語。PHP・HAML・TOML・TypeScript 等）。**Markdown はコードフェンス内の言語別ハイライトにも対応**
 - **差分レビュー操作**：`n`/`N` で hunk 間ジャンプ、`]`/`[` で変更ファイル間を移動。差分は**既定で左右（side-by-side）**表示（新規/削除ファイルは自動で単一表示）、`s` で単一表示と切替
-- ファイルツリーに変更ステータスを表示（`M`=変更 / `A`=追加 / `D`=削除 / `?`=未追跡、`.gitignore` 準拠）
+- ファイルツリーに変更ステータスを表示（`M`=変更 / `A`=追加 / `D`=削除 / `?`=未追跡）。ドットファイルや `.gitignore` 対象ファイルも**淡色**で一覧表示。無視対象ディレクトリ（`target/` 等）は表示するが中までは展開しない。`.git` ディレクトリは除外
 - **コードビューでも HEAD との変更行を gutter に表示**（追加=緑 / 変更=青 / 直前に削除あり=赤、エディタ風）
 - 単一バイナリ。Linux / macOS / Windows でビルド可能
 
@@ -32,8 +32,7 @@
 ## インストール
 
 Rust ツールチェーン（`cargo`）と **C コンパイラ**が必要です（libgit2 と
-tree-sitter 文法のビルドに使用）。bundled された文法ファイルを含むため、初回
-ビルドは数分・バイナリは約 80 MB になります。
+tree-sitter 文法のビルドに使用）。release バイナリは約 10 MB です。
 
 ### crates.io から（推奨）
 
@@ -243,9 +242,11 @@ srev [PATH]   # PATH 省略時はカレントディレクトリ
 
 ### シンタックスハイライト
 
-inkjet（tree-sitter ベース）により **70+ 言語**に対応しています。
-**Markdown** は tree-sitter の block + inline 文法で対応し、コードフェンス
-（```rust など）の中身も対応言語であれば言語別にハイライトします。
+[syntect](https://github.com/trishume/syntect) と拡張セット
+[two-face](https://github.com/CosmicHorrorDev/two-face) により **200+ 言語**に対応
+（PHP・**HAML**・TOML・TypeScript・Vue・Svelte 等）。`.blade.php` と `.phtml` は
+PHP として色付けします（Blade 専用文法は同梱なし）。
+**Markdown** はコードフェンス（```rust など）の中身も言語別にハイライトします。
 
 ### コードジャンプ（`gd` / `gr`）とアウトライン
 
@@ -258,7 +259,7 @@ Rust / Python / JavaScript / Go / Ruby / C のみ対応しています。
 | 役割 | クレート |
 |------|----------|
 | TUI / 端末抽象 | `ratatui` + `crossterm` |
-| シンタックスハイライト | `inkjet`（tree-sitter ベース、70+ 言語） |
+| シンタックスハイライト | `syntect` + `two-face`（200+ 言語） |
 | あいまい検索 | `nucleo-matcher` |
 | ファイル走査（gitignore 準拠） | `ignore` |
 | git 差分 / 状態 | `git2`（vendored libgit2） |

@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn finds_substring_case_insensitive_across_files() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let files = crate::finder::collect_files(&root);
+        let files = crate::finder::collect_files(&root, &|_| false);
         let mut s = ProjectSearch::new(&files);
         s.open();
         for c in "projectsearch".chars() {
@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn empty_query_has_no_results() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let files = crate::finder::collect_files(&root);
+        let files = crate::finder::collect_files(&root, &|_| false);
         let mut s = ProjectSearch::new(&files);
         s.open();
         assert_eq!(s.result_count(), 0);

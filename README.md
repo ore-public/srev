@@ -21,9 +21,9 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Project-wide content search** (`Ctrl-F`, case-insensitive substring) — jump to a matching line
 - **Inline fuzzy filtering** with `/` in tree, outline, and overlay panels
 - **`Ctrl-R` reload** — re-reads the open file, git state, tree, and index while keeping cursor position
-- **Syntax highlighting** for 70+ languages via inkjet / tree-sitter — **Markdown also highlights code inside fenced blocks** per language
+- **Syntax highlighting** for 200+ languages via syntect (incl. PHP, HAML, TOML, TypeScript…) — **Markdown also highlights code inside fenced blocks** per language
 - **Diff review navigation** — jump between hunks with `n`/`N`, between changed files with `]`/`[`. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
-- File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked) respecting `.gitignore`
+- File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked). Dotfiles and `.gitignore`d files are listed too, shown **dimmed**; ignored directories (e.g. `target/`) appear but aren't descended into, and the `.git` directory is excluded
 - **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD
 - Single binary. Builds on Linux / macOS / Windows
 
@@ -32,8 +32,7 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 ## Installation
 
 You need a Rust toolchain (`cargo`) and a **C compiler** (required to build
-libgit2 and tree-sitter grammars). The first build takes a few minutes and the
-binary is about 80 MB because grammar files are bundled.
+libgit2 and tree-sitter grammars). The release binary is about 10 MB.
 
 ### From crates.io (recommended)
 
@@ -245,9 +244,11 @@ The `g` prefix for `gg` / `gd` cannot be remapped.
 
 ### Syntax Highlighting
 
-**70+ languages** via inkjet (tree-sitter based).
-**Markdown** is supported via tree-sitter's block + inline grammars, and code
-inside fenced blocks (```rust, etc.) is highlighted per language when supported.
+**200+ languages** via [syntect](https://github.com/trishume/syntect) with the
+extended set from [two-face](https://github.com/CosmicHorrorDev/two-face),
+including PHP, **HAML**, TOML, TypeScript, Vue, Svelte, and more. `.blade.php`
+and `.phtml` are highlighted as PHP (a dedicated Blade grammar is not bundled).
+**Markdown** highlights code inside fenced blocks (```rust, etc.) per language.
 
 ### Code Jump (`gd` / `gr`) and Outline
 
@@ -260,7 +261,7 @@ Supported for **Rust, Python, JavaScript, Go, Ruby, C** only.
 | Role | Crate |
 |------|-------|
 | TUI / terminal abstraction | `ratatui` + `crossterm` |
-| Syntax highlighting | `inkjet` (tree-sitter based, 70+ languages) |
+| Syntax highlighting | `syntect` + `two-face` (200+ languages) |
 | Fuzzy matching | `nucleo-matcher` |
 | File traversal (gitignore-aware) | `ignore` |
 | Git diff / status | `git2` (vendored libgit2) |

@@ -4,13 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
 
 pub struct TreeNode {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
     pub expanded: bool,
+    /// `.gitignore` 等で無視対象か（表示色を変える）。
+    pub ignored: bool,
     pub children: Vec<TreeNode>,
 }
 
@@ -21,6 +22,7 @@ pub struct Row {
     pub path: PathBuf,
     pub is_dir: bool,
     pub expanded: bool,
+    pub ignored: bool,
 }
 
 pub struct Tree {
@@ -37,9 +39,9 @@ struct RowRef {
 }
 
 impl Tree {
-    pub fn new(root: &Path) -> Self {
+    pub fn new(root: &Path, is_ignored: &dyn Fn(&Path) -> bool) -> Self {
         let mut tree = Self {
-            root: build_tree(root),
+            root: build_tree(root, is_ignored),
             selected: 0,
             rows: Vec::new(),
         };
@@ -141,27 +143,22 @@ impl Tree {
     }
 }
 
-/// 走査してネスト木を構築する。
-fn build_tree(root: &Path) -> TreeNode {
+/// 走査してネスト木を構築する。無視対象も含める（`ignored` を立てる）。
+fn build_tree(root: &Path, is_ignored: &dyn Fn(&Path) -> bool) -> TreeNode {
     let mut root_node = TreeNode {
         name: display_name(root),
         path: root.to_path_buf(),
         is_dir: true,
         expanded: true,
+        ignored: false,
         children: Vec::new(),
     };
 
-    for result in WalkBuilder::new(root).build() {
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let Ok(rel) = path.strip_prefix(root) else {
+    for entry in crate::finder::walk_visible(root, is_ignored) {
+        let Ok(rel) = entry.abs.strip_prefix(root) else {
             continue;
         };
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        insert(&mut root_node, rel, path, is_dir);
+        insert(&mut root_node, rel, &entry.abs, entry.is_dir, entry.ignored);
     }
 
     sort_tree(&mut root_node);
@@ -169,7 +166,7 @@ fn build_tree(root: &Path) -> TreeNode {
 }
 
 /// 相対パスの各コンポーネントを辿り、なければ作りながら葉を挿入する。
-fn insert(node: &mut TreeNode, rel: &Path, full: &Path, is_dir: bool) {
+fn insert(node: &mut TreeNode, rel: &Path, full: &Path, is_dir: bool, ignored: bool) {
     let mut current = node;
     let components: Vec<_> = rel.components().collect();
     for (i, comp) in components.iter().enumerate() {
@@ -184,6 +181,8 @@ fn insert(node: &mut TreeNode, rel: &Path, full: &Path, is_dir: bool) {
                     path: full.to_path_buf(),
                     is_dir: if is_leaf { is_dir } else { true },
                     expanded: false,
+                    // 葉のみ実際の無視フラグ。中間ディレクトリは非無視。
+                    ignored: is_leaf && ignored,
                     children: Vec::new(),
                 });
                 current.children.len() - 1
@@ -235,6 +234,7 @@ fn flatten(node: &TreeNode, depth: usize, out: &mut Vec<Row>) {
             path: child.path.clone(),
             is_dir: child.is_dir,
             expanded: child.expanded,
+            ignored: child.ignored,
         });
         if child.is_dir && child.expanded {
             flatten(child, depth + 1, out);
@@ -257,12 +257,24 @@ mod tests {
     #[test]
     fn reveal_expands_and_selects_nested_file() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let mut tree = Tree::new(&root);
+        let mut tree = Tree::new(&root, &|_| false);
         let target = root.join("src").join("app.rs");
         tree.reveal(&target);
         let rows = tree.rows();
         let sel = &rows[tree.selected];
         assert_eq!(sel.path, target, "selected row should be the revealed file");
         assert!(!sel.is_dir);
+    }
+
+    #[test]
+    fn tree_shows_dotfiles() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let tree = Tree::new(&root, &|_| false);
+        // 直下の .gitignore（ドットファイル）がツリーに出る。
+        let names: Vec<String> = tree.rows().iter().map(|r| r.name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n.contains(".gitignore")),
+            "dotfile not shown: {names:?}"
+        );
     }
 }

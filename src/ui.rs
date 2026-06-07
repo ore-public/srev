@@ -256,6 +256,9 @@ fn tree_line(row: &Row, selected: bool, status: Option<FileStatus>) -> Line<'sta
 
     let base = if selected {
         Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else if row.ignored {
+        // .gitignore 対象は淡色で区別。
+        Style::default().fg(Color::DarkGray)
     } else if row.is_dir {
         Style::default().fg(Color::Blue)
     } else {
@@ -642,9 +645,11 @@ fn render_finder(frame: &mut Frame, area: Rect, finder: &Finder) {
     let rows: Vec<Line> = finder
         .visible(list_area.height as usize)
         .into_iter()
-        .map(|(path, selected)| {
+        .map(|(path, selected, ignored)| {
             let style = if selected {
                 Style::default().fg(Color::Black).bg(Color::Magenta)
+            } else if ignored {
+                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default()
             };

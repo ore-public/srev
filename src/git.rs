@@ -88,6 +88,12 @@ impl GitInfo {
         map
     }
 
+    /// パスが `.gitignore` 等で無視対象か（作業ディレクトリ相対で判定）。
+    pub fn is_ignored(&self, abs: &Path) -> bool {
+        let rel = abs.strip_prefix(&self.workdir).unwrap_or(abs);
+        self.repo.is_path_ignored(rel).unwrap_or(false)
+    }
+
     /// 指定ファイルの作業ツリー vs HEAD 差分を行リストとして返す。
     pub fn diff_file(&self, path: &Path) -> Option<Vec<DiffLine>> {
         let rel = path.strip_prefix(&self.workdir).ok()?;

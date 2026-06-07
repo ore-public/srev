@@ -14,25 +14,85 @@ pub struct FileEntry {
     pub rel: String,
     /// 開くときの絶対パス。
     pub abs: PathBuf,
+    /// `.gitignore` 等で無視対象か（表示色を変える）。
+    pub ignored: bool,
 }
 
-/// root 配下の（gitignore を尊重した）ファイル一覧を収集する。
-pub fn collect_files(root: &Path) -> Vec<FileEntry> {
-    let mut entries = Vec::new();
-    for result in WalkBuilder::new(root).build() {
-        let Ok(entry) = result else { continue };
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
-            continue;
+/// 走査で得た 1 エントリ（ファイル/ディレクトリ）。
+pub struct Entry {
+    pub abs: PathBuf,
+    pub is_dir: bool,
+    pub ignored: bool,
+}
+
+/// root 配下を走査する。`.gitignore` 対象でも**ファイルは表示**し（色分け用に
+/// `ignored` を立てる）、無視対象の**ディレクトリには降りない**（target/ 等の洪水回避）。
+/// ドットファイルは表示、`.git` ディレクトリは常に除外。
+pub fn walk_visible(root: &Path, is_ignored: &dyn Fn(&Path) -> bool) -> Vec<Entry> {
+    let mut out = Vec::new();
+    visit_dir(root, is_ignored, false, &mut out);
+    out
+}
+
+fn visit_dir(dir: &Path, is_ignored: &dyn Fn(&Path) -> bool, parent_ignored: bool, out: &mut Vec<Entry>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut kids: Vec<(PathBuf, bool)> = rd
+        .flatten()
+        .filter(|e| e.file_name() != ".git")
+        .map(|e| {
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            (e.path(), is_dir)
+        })
+        .collect();
+    // ディレクトリ優先 → 名前順。
+    kids.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(a.0.file_name().cmp(&b.0.file_name()))
+    });
+    for (abs, is_dir) in kids {
+        let ignored = parent_ignored || is_ignored(&abs);
+        out.push(Entry {
+            abs: abs.clone(),
+            is_dir,
+            ignored,
+        });
+        // 無視対象ディレクトリの中身は出さない（洪水回避）。
+        if is_dir && !ignored {
+            visit_dir(&abs, is_ignored, ignored, out);
         }
-        let abs = entry.path().to_path_buf();
-        let rel = abs
-            .strip_prefix(root)
-            .unwrap_or(&abs)
-            .to_string_lossy()
-            .to_string();
-        entries.push(FileEntry { rel, abs });
     }
-    entries
+}
+
+/// 共通のファイル走査ビルダ。`.gitignore` は尊重しつつ、ドットファイルも
+/// 表示する（`.hidden(false)`）。ただし `.git` ディレクトリは除外。
+pub fn walker(root: &Path) -> WalkBuilder {
+    let mut b = WalkBuilder::new(root);
+    b.hidden(false)
+        .filter_entry(|e| e.file_name().to_str() != Some(".git"));
+    b
+}
+
+/// root 配下のファイル一覧を収集する。無視対象ファイルも含む（`ignored` で識別）。
+pub fn collect_files(root: &Path, is_ignored: &dyn Fn(&Path) -> bool) -> Vec<FileEntry> {
+    walk_visible(root, is_ignored)
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| {
+            let rel = e
+                .abs
+                .strip_prefix(root)
+                .unwrap_or(&e.abs)
+                .to_string_lossy()
+                .to_string();
+            FileEntry {
+                rel,
+                abs: e.abs,
+                ignored: e.ignored,
+            }
+        })
+        .collect()
 }
 
 pub struct Finder {
@@ -100,12 +160,16 @@ impl Finder {
     }
 
     /// 表示用に、上位 `limit` 件の相対パスを返す。
-    pub fn visible(&self, limit: usize) -> Vec<(&str, bool)> {
+    /// (相対パス, 選択中か, 無視対象か) を返す。
+    pub fn visible(&self, limit: usize) -> Vec<(&str, bool, bool)> {
         self.results
             .iter()
             .take(limit)
             .enumerate()
-            .map(|(i, &idx)| (self.entries[idx].rel.as_str(), i == self.selected))
+            .map(|(i, &idx)| {
+                let e = &self.entries[idx];
+                (e.rel.as_str(), i == self.selected, e.ignored)
+            })
             .collect()
     }
 
@@ -141,7 +205,7 @@ mod tests {
     #[test]
     fn fuzzy_ranks_matching_paths_first() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let mut finder = Finder::from_files(collect_files(root.as_path()));
+        let mut finder = Finder::from_files(collect_files(root.as_path(), &|_| false));
         finder.open();
         for c in "highlight".chars() {
             finder.push_char(c);
@@ -151,5 +215,58 @@ mod tests {
             top.file_name().unwrap().to_string_lossy().contains("highlight"),
             "top result was {top:?}"
         );
+    }
+
+    #[test]
+    fn collect_files_includes_dotfiles_but_not_git() {
+        let dir = std::env::temp_dir().join(format!("srev_dot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "x").unwrap();
+        std::fs::write(dir.join("normal.txt"), "y").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git").join("config"), "z").unwrap();
+
+        let rels: Vec<String> = collect_files(&dir, &|_| false)
+            .into_iter()
+            .map(|f| f.rel)
+            .collect();
+        assert!(rels.iter().any(|r| r == ".env"), "dotfile missing: {rels:?}");
+        assert!(rels.iter().any(|r| r == "normal.txt"));
+        assert!(
+            !rels.iter().any(|r| r.contains(".git")),
+            ".git should be excluded: {rels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignored_files_shown_but_ignored_dirs_not_descended() {
+        let dir = std::env::temp_dir().join(format!("srev_ign_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("ignore_dir")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "i").unwrap();
+        std::fs::write(dir.join("sub").join("b.txt"), "b").unwrap();
+        std::fs::write(dir.join("ignore_dir").join("inner.txt"), "x").unwrap();
+
+        let is_ignored = |p: &Path| {
+            matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("ignored.txt") | Some("ignore_dir")
+            )
+        };
+        let files = collect_files(&dir, &is_ignored);
+        let find = |rel: &str| files.iter().find(|f| f.rel == rel);
+
+        assert!(find("a.txt").is_some_and(|f| !f.ignored));
+        assert!(find("ignored.txt").is_some_and(|f| f.ignored), "ignored flag");
+        assert!(find("sub/b.txt").is_some(), "normal subdir descended");
+        assert!(
+            find("ignore_dir/inner.txt").is_none(),
+            "ignored dir should not be descended"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

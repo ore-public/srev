@@ -30,22 +30,19 @@ Obligation: retain libgit2's copyright notice and a copy of its license
 source. The source of `nucleo-matcher` is available on crates.io:
 <https://crates.io/crates/nucleo-matcher>.
 
-## Bundled grammars and themes
+## Syntax highlighting (syntect + two-face)
 
-### inkjet (MIT OR Apache-2.0)
+Syntax highlighting uses `syntect` (MIT) together with the extended syntax and
+theme set provided by `two-face` (MIT). `two-face` bundles Sublime-syntax
+definitions and color themes collected by the `bat` project from various
+Sublime Text packages; each retains its original (permissive, mostly MIT)
+license. The default color theme is syntect's bundled `base16-ocean.dark`.
 
-`inkjet` bundles many tree-sitter grammars and a collection of Helix editor
-themes. `srev` uses the bundled `ONEDARK` theme, which originates from the Helix
-editor repository (author: Gokul Soumya) and is re-distributed by inkjet
-under `MIT OR Apache-2.0`. Other bundled themes carry their original authors'
-licenses (mostly MIT) and inkjet ships per-theme `.LICENSE` files. Some
-bundled highlight queries also originate from the Helix editor (MPL-2.0);
-these are vendored and re-distributed by inkjet.
+## Code-navigation grammars (tree-sitter)
 
-Grammars for the languages used by code navigation (Rust, C, Go, Python,
-JavaScript, Ruby) and for Markdown (`tree-sitter-md`, block + inline) are
-also pulled directly via the respective `tree-sitter-*` crates, which are
-MIT licensed.
+Symbol extraction for `gd` / outline (Rust, C, Go, Python, JavaScript, Ruby)
+uses `tree-sitter` with the respective `tree-sitter-*` grammar crates and
+`tree-sitter-tags`, all MIT licensed.
 
 ## Unicode data
 
@@ -59,9 +56,10 @@ Contains data derived from the Unicode Character Database.
 
 The remaining dependencies are permissively licensed (MIT, Apache-2.0,
 MIT OR Apache-2.0, Unlicense OR MIT, Apache-2.0 OR BSL-1.0, Zlib, etc.),
-including but not limited to: `ratatui`, `crossterm`, `tree-sitter` and the
-`tree-sitter-*` grammar crates, `tree-sitter-tags`, `ignore`, `walkdir`,
-`aho-corasick`, `memchr`, `arboard`, `toml`, `clap`, `anyhow`.
+including but not limited to: `ratatui`, `crossterm`, `syntect`, `two-face`,
+`tree-sitter` and the `tree-sitter-*` grammar crates, `tree-sitter-tags`,
+`ignore`, `walkdir`, `aho-corasick`, `memchr`, `arboard`, `toml`, `clap`,
+`anyhow`.
 
 Run `cargo deny check licenses` to validate the full dependency tree against
 the policy in `deny.toml`.

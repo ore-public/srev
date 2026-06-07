@@ -337,7 +337,6 @@ fn styled_line(spans: Vec<Span<'static>>, bg: Option<Color>) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkjet::Language;
 
     fn dl(kind: DiffKind, old: Option<u32>, new: Option<u32>, content: &str) -> DiffLine {
         DiffLine {
@@ -351,6 +350,7 @@ mod tests {
     #[test]
     fn split_pairs_changes_and_records_hunks() {
         let mut h = CodeHighlighter::new();
+        let plain = h.plain();
         let code_lines = vec![Line::from("ctx"), Line::from("new1")];
         let diff = vec![
             dl(DiffKind::Hunk, None, None, "@@ -1,2 +1,2 @@"),
@@ -358,7 +358,7 @@ mod tests {
             dl(DiffKind::Del, Some(2), None, "old"),
             dl(DiffKind::Add, None, Some(2), "new1"),
         ];
-        let (split, hunks) = build_split(&diff, &code_lines, &mut h, Syntax::Lang(Language::Plaintext));
+        let (split, hunks) = build_split(&diff, &code_lines, &mut h, plain);
         // hunk(1) + context(1) + del/add ペア(1) = 3 行
         assert_eq!(split.len(), 3, "split rows");
         assert_eq!(hunks, vec![0]);
@@ -367,13 +367,14 @@ mod tests {
     #[test]
     fn split_is_lazy_until_ensured() {
         let mut h = CodeHighlighter::new();
+        let plain = h.plain();
         let code = vec![Line::from("ctx"), Line::from("new1")];
         let diff = vec![
             dl(DiffKind::Context, Some(1), Some(1), "ctx"),
             dl(DiffKind::Del, Some(2), None, "old"),
             dl(DiffKind::Add, None, Some(2), "new1"),
         ];
-        let mut r = build(&diff, &code, &mut h, Syntax::Lang(Language::Plaintext));
+        let mut r = build(&diff, &code, &mut h, plain);
         // build() では split を作らない。
         assert!(r.split_rows().is_none(), "split must be lazy");
         assert_eq!(r.row_count(true), 0);
@@ -386,6 +387,7 @@ mod tests {
     #[test]
     fn line_marks_classify_add_modify_delete() {
         let mut h = CodeHighlighter::new();
+        let plain = h.plain();
         let code = vec![
             Line::from("ctx"),
             Line::from("added"),
@@ -400,7 +402,7 @@ mod tests {
             dl(DiffKind::Del, Some(3), None, "removed"),  // 純削除（4行目の上）
             dl(DiffKind::Context, Some(4), Some(4), "ctx2"),
         ];
-        let r = build(&diff, &code, &mut h, Syntax::Lang(Language::Plaintext));
+        let r = build(&diff, &code, &mut h, plain);
         let marks = r.line_marks(4);
         assert_eq!(marks[0], LineMark::None);
         assert_eq!(marks[1], LineMark::Added);
@@ -411,6 +413,7 @@ mod tests {
     #[test]
     fn single_column_for_new_and_deleted_files() {
         let mut h = CodeHighlighter::new();
+        let plain = h.plain();
         let code = vec![Line::from("x"), Line::from("y")];
         // 新規ファイル: 追加のみ・文脈なし
         let new_file = vec![
@@ -418,22 +421,23 @@ mod tests {
             dl(DiffKind::Add, None, Some(1), "x"),
             dl(DiffKind::Add, None, Some(2), "y"),
         ];
-        assert!(build(&new_file, &code, &mut h, Syntax::Lang(Language::Plaintext)).single_column);
+        assert!(build(&new_file, &code, &mut h, plain).single_column);
         // 削除ファイル: 削除のみ
         let del_file = vec![dl(DiffKind::Del, Some(1), None, "x")];
-        assert!(build(&del_file, &code, &mut h, Syntax::Lang(Language::Plaintext)).single_column);
+        assert!(build(&del_file, &code, &mut h, plain).single_column);
         // 変更: 文脈あり → 単一にしない
         let modified = vec![
             dl(DiffKind::Context, Some(1), Some(1), "x"),
             dl(DiffKind::Del, Some(2), None, "old"),
             dl(DiffKind::Add, None, Some(2), "y"),
         ];
-        assert!(!build(&modified, &code, &mut h, Syntax::Lang(Language::Plaintext)).single_column);
+        assert!(!build(&modified, &code, &mut h, plain).single_column);
     }
 
     #[test]
     fn split_pads_unequal_del_add() {
         let mut h = CodeHighlighter::new();
+        let plain = h.plain();
         let code_lines = vec![Line::from("a"), Line::from("b")];
         // 削除2 / 追加1 → max=2 行に揃う（不足側は空行）
         let diff = vec![
@@ -441,7 +445,7 @@ mod tests {
             dl(DiffKind::Del, Some(2), None, "d2"),
             dl(DiffKind::Add, None, Some(1), "a"),
         ];
-        let (split, _) = build_split(&diff, &code_lines, &mut h, Syntax::Lang(Language::Plaintext));
+        let (split, _) = build_split(&diff, &code_lines, &mut h, plain);
         assert_eq!(split.len(), 2, "padded to max(del,add)");
     }
 }
