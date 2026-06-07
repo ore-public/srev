@@ -6,6 +6,7 @@ mod git;
 mod grep;
 mod highlight;
 mod keymap;
+mod lsp;
 mod tags;
 mod tree;
 mod ui;

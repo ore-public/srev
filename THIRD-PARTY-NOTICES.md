@@ -38,17 +38,24 @@ definitions and color themes collected by the `bat` project from various
 Sublime Text packages; each retains its original (permissive, mostly MIT)
 license. The default color theme is syntect's bundled `base16-ocean.dark`.
 
-## Code-navigation grammars (tree-sitter)
+## Code navigation (LSP client + tree-sitter)
 
-Symbol extraction for `gd` / outline (Rust, C, Go, Python, JavaScript, Ruby)
-uses `tree-sitter` with the respective `tree-sitter-*` grammar crates and
-`tree-sitter-tags`, all MIT licensed.
+`gd` / `gr` prefer an external language server over LSP (JSON-RPC via stdio),
+using the `lsp-types` (MIT) type definitions together with `serde` /
+`serde_json` (MIT OR Apache-2.0). The fallback symbol index and the outline
+pane use `tree-sitter` with the respective `tree-sitter-*` grammar crates and
+`tree-sitter-tags`, all MIT licensed (Rust, C, Go, Python, JavaScript, Ruby).
+Language servers themselves are separate programs invoked at runtime and are
+**not** bundled into or linked with `srev`.
 
 ## Unicode data
 
-### unicode-ident — (MIT OR Apache-2.0) AND Unicode-3.0
+### unicode-ident, and ICU4X crates (`icu_*` via `url` / `idna`) — Unicode-3.0
 
-Contains data derived from the Unicode Character Database.
+`unicode-ident` is (MIT OR Apache-2.0) AND Unicode-3.0. The `url` crate (used to
+build LSP `file://` document URIs) pulls in `idna` and the ICU4X `icu_*` crates,
+which are licensed under **Unicode-3.0**. All contain data derived from the
+Unicode Character Database.
 
 > Copyright © Unicode, Inc. Distributed under the Unicode License.
 
@@ -58,8 +65,8 @@ The remaining dependencies are permissively licensed (MIT, Apache-2.0,
 MIT OR Apache-2.0, Unlicense OR MIT, Apache-2.0 OR BSL-1.0, Zlib, etc.),
 including but not limited to: `ratatui`, `crossterm`, `syntect`, `two-face`,
 `tree-sitter` and the `tree-sitter-*` grammar crates, `tree-sitter-tags`,
-`ignore`, `walkdir`, `aho-corasick`, `memchr`, `arboard`, `toml`, `clap`,
-`anyhow`.
+`lsp-types`, `serde`, `serde_json`, `url`, `ignore`, `walkdir`, `aho-corasick`,
+`memchr`, `arboard`, `toml`, `clap`, `anyhow`.
 
 Run `cargo deny check licenses` to validate the full dependency tree against
 the policy in `deny.toml`.

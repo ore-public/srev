@@ -12,7 +12,8 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Working tree vs HEAD diff** on demand with `d` — review uncommitted changes
 - **Toggle diff ⇄ full code** with `d`, preserving the corresponding line position
 - **Vim-like cursor** for reading code; **jump to definition** under cursor with `gd`
-- **Find references** with `gr` — list call sites of the symbol under the cursor across the project and jump to one (name-based, approximate)
+- **Find references** with `gr` — list usages of the symbol under the cursor across the project and jump to one
+- **LSP-powered `gd` / `gr`** — when a language server is available (rust-analyzer / intelephense / ruby-lsp by default, configurable), jumps use real semantic analysis. Falls back automatically to a built-in tree-sitter tag index when no server is configured or running
 - **Jump history** — every jump (`gd`, outline, project search, `gg`/`G`, in-file search) remembers where you came from; go back/forward with `(` / `)` (works across files). A **jump-history pane on the right** visualizes the trail with the current position highlighted (toggle with `J`)
 - **Visual mode** (`v`/`V`) to select a range, then `y` to copy to clipboard
 - **Outline pane** (bottom-left) lists symbols in the open file for quick navigation
@@ -238,6 +239,59 @@ Add entries under `[keys]` as `"key" = "action"`.
 Use `"none"` to disable a key binding.
 The `g` prefix for `gg` / `gd` cannot be remapped.
 
+### Language Servers (LSP)
+
+`gd` / `gr` use a language server when one is available, and otherwise fall back
+to the tree-sitter tag index (see [Code Jump](#code-jump-gd--gr-and-outline)).
+
+**Built-in defaults** (used out of the box if the binary is on your `$PATH`):
+
+| Language | Extensions | Default command | Tag fallback |
+|----------|------------|-----------------|--------------|
+| Rust | `rs` | `rust-analyzer` | yes |
+| PHP | `php`, `phtml` | `intelephense --stdio` | **no** |
+| Ruby | `rb`, `rake`, `gemspec` | `ruby-lsp` | yes |
+
+> PHP has no tag fallback, so `gd` / `gr` for PHP require a running server.
+> Install your server of choice and make sure it is on `$PATH` (e.g.
+> `rustup component add rust-analyzer`, `npm i -g intelephense`, `gem install ruby-lsp`).
+
+**Configuration.** Add `[lsp.<id>]` tables to `~/.config/srev/config.toml`
+(shared with the keymap config) and/or a repo-local `<project-root>/.srev.toml`,
+which takes precedence. Each entry sets the file `extensions` and the launch
+`command`. You can override a default, add a brand-new language **without
+recompiling**, or disable one with an empty command.
+
+```toml
+# Override the Ruby server
+[lsp.ruby]
+extensions = ["rb", "rake", "gemspec"]
+command = ["solargraph", "stdio"]   # instead of the default ruby-lsp
+
+# Use an alternative PHP server
+[lsp.php]
+extensions = ["php", "phtml"]
+command = ["phpactor", "language-server"]
+
+# Add a language that isn't built in (no rebuild needed)
+[lsp.go]
+extensions = ["go"]
+command = ["gopls"]
+
+# Disable Rust LSP (fall back to the tag index)
+[lsp.rust]
+command = []
+```
+
+Notes:
+
+- srev is **read-only**, so it only sends `textDocument/didOpen` — your files are
+  never modified by the server.
+- Servers are spawned lazily on the first `gd` / `gr` for a language and are
+  terminated when srev exits.
+- Right after opening a file, the first `gd` may fall back to the tag index while
+  the server is still indexing — press it again once the server is ready.
+
 ---
 
 ## Supported Languages
@@ -252,7 +306,17 @@ and `.phtml` are highlighted as PHP (a dedicated Blade grammar is not bundled).
 
 ### Code Jump (`gd` / `gr`) and Outline
 
-Supported for **Rust, Python, JavaScript, Go, Ruby, C** only.
+`gd` / `gr` resolve in two layers:
+
+1. **LSP (preferred)** — if a language server is installed and on your `$PATH`,
+   jumps use real semantic analysis (accurate across same-named symbols, imports,
+   and scopes). See [Language Servers (LSP)](#language-servers-lsp) for the
+   built-in defaults and how to configure them.
+2. **tree-sitter tag index (fallback)** — used when no server is configured or
+   while a server is still starting up. Name-based and approximate, supported for
+   **Rust, Python, JavaScript, Go, Ruby, C**.
+
+The **Outline pane** always uses the tree-sitter index (same language set).
 
 ---
 
@@ -265,9 +329,10 @@ Supported for **Rust, Python, JavaScript, Go, Ruby, C** only.
 | Fuzzy matching | `nucleo-matcher` |
 | File traversal (gitignore-aware) | `ignore` |
 | Git diff / status | `git2` (vendored libgit2) |
-| Symbol index / definition jump | `tree-sitter-tags` |
+| Symbol index / definition jump (fallback) | `tree-sitter-tags` |
+| LSP client for `gd` / `gr` | `lsp-types` + `serde_json` (JSON-RPC over stdio) |
 | Clipboard | `arboard` |
-| Keymap config | `toml` |
+| Config (keymap + LSP) | `toml` |
 
 ---
 

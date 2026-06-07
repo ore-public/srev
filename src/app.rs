@@ -14,6 +14,7 @@ use crate::git::{FileStatus, GitInfo};
 use crate::grep::ProjectSearch;
 use crate::highlight::CodeHighlighter;
 use crate::keymap::{Action, Chord, Keymap};
+use crate::lsp::{self, Loc, LspManager};
 use crate::tags::{LangConfigs, ProjectIndex, Symbol};
 use crate::tree::Tree;
 
@@ -231,6 +232,21 @@ impl OpenFile {
     }
 }
 
+/// 応答待ちの LSP ナビゲーション要求の種別。
+enum NavKind {
+    Def,
+    Refs,
+}
+
+/// 送信済み LSP 要求のメタ情報（応答到着時/タイムアウト時に使う）。
+struct PendingNav {
+    kind: NavKind,
+    /// カーソル下の語（空応答/タイムアウト時の tags フォールバックに使う）。
+    word: String,
+    /// 送信時刻（タイムアウト判定用）。
+    sent: Instant,
+}
+
 pub struct App {
     pub root: PathBuf,
     pub focus: Focus,
@@ -273,6 +289,10 @@ pub struct App {
     fuzzy: Fuzzy,
     lang_configs: LangConfigs,
     index: ProjectIndex,
+    /// LSP クライアント（`gd`/`gr` を LSP 優先で解決。未対応言語は tags にフォールバック）。
+    lsp: LspManager,
+    /// 送信済みで応答待ちの LSP ナビゲーション要求（要求 ID → 内容）。
+    pending_nav: HashMap<i64, PendingNav>,
     git: Option<GitInfo>,
     highlighter: CodeHighlighter,
     keymap: Keymap,
@@ -296,6 +316,7 @@ impl App {
         let grep = ProjectSearch::new(&all_files);
         let mut index = ProjectIndex::new(&root);
         index.start(); // 起動直後にバックグラウンド構築を開始
+        let lsp = LspManager::new(&root);
         let statuses = git.as_ref().map(|g| g.statuses()).unwrap_or_default();
         let changed = changed_entries(&statuses, &root);
         Self {
@@ -327,6 +348,8 @@ impl App {
             fuzzy: Fuzzy::new(),
             lang_configs: LangConfigs::new(),
             index,
+            lsp,
+            pending_nav: HashMap::new(),
             git,
             highlighter: CodeHighlighter::new(),
             keymap: Keymap::load(),
@@ -343,6 +366,8 @@ impl App {
             if self.index.poll() {
                 self.flash = Some("index ready".into());
             }
+            // LSP の応答を取り込み、ジャンプ／参照一覧を確定する。
+            self.poll_lsp();
             self.expire_flash();
         }
         Ok(())
@@ -1120,13 +1145,54 @@ impl App {
         self.recenter = true;
     }
 
-    /// カーソル下の語の定義へジャンプする。索引が未完了なら知らせる。
+    /// カーソル下の語の定義へジャンプする。LSP 優先、未対応/未準備なら tags にフォールバック。
     fn goto_definition(&mut self) {
-        let Some(word) = self.open.as_ref().and_then(|o| o.word_under_cursor()) else {
+        let Some((word, line, char_col, path, line_str, text)) = self.nav_request_cursor() else {
             return;
         };
+        if let Some(lang) = self.lsp.lang_id_for(&path) {
+            if self.lsp.ensure_open(&path, &lang, &text) {
+                self.flash = Some(format!("LSP for {lang} unavailable (using tags)"));
+            }
+            if self.lsp.is_ready_for(&path) {
+                let col = lsp::char_to_utf16(&line_str, char_col);
+                if let Some(id) = self.lsp.request_definition(&path, line as u32, col) {
+                    self.pending_nav.insert(
+                        id,
+                        PendingNav {
+                            kind: NavKind::Def,
+                            word,
+                            sent: Instant::now(),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        self.definition_via_tags(&word);
+    }
+
+    /// `gd`/`gr` 用にカーソル下の (語, 行, char列, パス, 行文字列, ファイル全文) を集める。
+    /// `word_under_cursor` が None なら何もしない。
+    fn nav_request_cursor(&self) -> Option<(String, usize, usize, PathBuf, String, String)> {
+        self.open.as_ref().and_then(|o| {
+            o.word_under_cursor().map(|w| {
+                (
+                    w,
+                    o.cursor_line,
+                    o.cursor_col,
+                    o.path.clone(),
+                    o.raw_lines.get(o.cursor_line).cloned().unwrap_or_default(),
+                    o.raw_lines.join("\n"),
+                )
+            })
+        })
+    }
+
+    /// tree-sitter-tags による定義ジャンプ（LSP 非対応/未準備/空応答時のフォールバック）。
+    fn definition_via_tags(&mut self, word: &str) {
         self.index.start(); // 念のため（未開始なら開始）
-        match self.index.definition(&word) {
+        match self.index.definition(word) {
             Some((path, line, col)) => {
                 self.record_jump_origin(); // 飛ぶ前の位置を履歴へ
                 let same = self.open.as_ref().is_some_and(|o| o.path == path);
@@ -1145,18 +1211,130 @@ impl App {
         }
     }
 
-    /// カーソル下の語の参照（呼び出し元など）一覧をオーバーレイで開く。
-    /// 名前ベースのため、同名シンボルも含まれる近似一覧。
-    fn goto_references(&mut self) {
-        let Some(word) = self.open.as_ref().and_then(|o| o.word_under_cursor()) else {
+    /// LSP 応答の取り込みとタイムアウト処理（毎フレーム呼ぶ）。
+    fn poll_lsp(&mut self) {
+        for (id, locs) in self.lsp.poll() {
+            if let Some(p) = self.pending_nav.remove(&id) {
+                match p.kind {
+                    NavKind::Def => self.apply_definition(p.word, locs),
+                    NavKind::Refs => self.apply_references(p.word, locs),
+                }
+            }
+        }
+        // 一定時間応答が無い要求は tags フォールバックへ（rust-analyzer 索引中対策）。
+        let timed_out: Vec<i64> = self
+            .pending_nav
+            .iter()
+            .filter(|(_, p)| p.sent.elapsed() > lsp::REQUEST_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in timed_out {
+            if let Some(p) = self.pending_nav.remove(&id) {
+                match p.kind {
+                    NavKind::Def => self.definition_via_tags(&p.word),
+                    NavKind::Refs => self.references_via_tags(&p.word),
+                }
+            }
+        }
+    }
+
+    /// LSP の定義応答を適用してジャンプする（空なら tags フォールバック）。
+    fn apply_definition(&mut self, word: String, locs: Vec<Loc>) {
+        let Some(loc) = locs.into_iter().next() else {
+            self.definition_via_tags(&word);
             return;
         };
+        self.record_jump_origin(); // 飛ぶ前の位置を履歴へ
+        let same = self.open.as_ref().is_some_and(|o| o.path == loc.path);
+        if !same {
+            self.open_file(&loc.path);
+        }
+        // UTF-16 列 → char 列（対象ファイルの該当行から）。
+        let col = self
+            .open
+            .as_ref()
+            .and_then(|o| o.raw_lines.get(loc.line))
+            .map(|l| lsp::utf16_to_char(l, loc.character))
+            .unwrap_or(0);
+        self.jump_to_code_pos(loc.line, col);
+    }
+
+    /// LSP の参照応答を参照一覧オーバーレイへ（空なら tags フォールバック）。
+    fn apply_references(&mut self, word: String, locs: Vec<Loc>) {
+        if locs.is_empty() {
+            self.references_via_tags(&word);
+            return;
+        }
+        // 同じファイルは 1 回だけ読んでプレビュー行と列変換に使う。
+        let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let mut hits = Vec::new();
+        for loc in locs {
+            let lines = cache.entry(loc.path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&loc.path)
+                    .map(|s| s.lines().map(|l| l.to_string()).collect())
+                    .unwrap_or_default()
+            });
+            let line_str = lines.get(loc.line);
+            let col = line_str.map(|l| lsp::utf16_to_char(l, loc.character)).unwrap_or(0);
+            let preview = line_str.map(|l| l.trim().to_string()).unwrap_or_default();
+            let rel = loc
+                .path
+                .strip_prefix(&self.root)
+                .unwrap_or(&loc.path)
+                .to_string_lossy()
+                .into_owned();
+            hits.push(RefHit {
+                rel,
+                abs: loc.path,
+                line: loc.line,
+                col,
+                preview,
+            });
+        }
+        hits.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
+        self.refs = Some(RefList {
+            name: word,
+            hits,
+            selected: 0,
+        });
+    }
+
+    /// カーソル下の語の参照一覧をオーバーレイで開く。LSP 優先、未対応/未準備なら tags。
+    fn goto_references(&mut self) {
+        let Some((word, line, char_col, path, line_str, text)) = self.nav_request_cursor() else {
+            return;
+        };
+        if let Some(lang) = self.lsp.lang_id_for(&path) {
+            if self.lsp.ensure_open(&path, &lang, &text) {
+                self.flash = Some(format!("LSP for {lang} unavailable (using tags)"));
+            }
+            if self.lsp.is_ready_for(&path) {
+                let col = lsp::char_to_utf16(&line_str, char_col);
+                if let Some(id) = self.lsp.request_references(&path, line as u32, col) {
+                    self.pending_nav.insert(
+                        id,
+                        PendingNav {
+                            kind: NavKind::Refs,
+                            word,
+                            sent: Instant::now(),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        self.references_via_tags(&word);
+    }
+
+    /// tree-sitter-tags による参照一覧（名前ベース近似。LSP フォールバック）。
+    /// 名前ベースのため、同名シンボルも含まれる近似一覧。
+    fn references_via_tags(&mut self, word: &str) {
         self.index.start();
         if self.index.is_building() {
             self.flash = Some("indexing… (retry gr when ready)".into());
             return;
         }
-        let locs = self.index.references(&word);
+        let locs = self.index.references(word);
         if locs.is_empty() {
             self.flash = Some(format!("no references: {word}"));
             return;
@@ -1186,7 +1364,7 @@ impl App {
         }
         hits.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
         self.refs = Some(RefList {
-            name: word,
+            name: word.to_string(),
             hits,
             selected: 0,
         });
