@@ -36,6 +36,8 @@ pub enum Action {
     LineEnd,
     ToggleDiff,
     GotoDef,
+    /// 参照（呼び出し元）一覧を開く。
+    GotoReferences,
     Find,
     SearchNext,
     SearchPrev,
@@ -54,6 +56,12 @@ pub enum Action {
     ToggleSplit,
     /// プロジェクト全体の本文検索。
     Grep,
+    /// ジャンプ履歴を戻る（飛ぶ前の位置へ）。
+    JumpBack,
+    /// ジャンプ履歴を進む。
+    JumpForward,
+    /// 右側のジャンプ履歴ペインの表示/非表示を切替。
+    ToggleJumps,
 }
 
 impl Action {
@@ -76,6 +84,7 @@ impl Action {
             "line_end" => Self::LineEnd,
             "toggle_diff" => Self::ToggleDiff,
             "goto_def" => Self::GotoDef,
+            "goto_references" | "references" | "goto_refs" => Self::GotoReferences,
             "find" => Self::Find,
             "search_next" => Self::SearchNext,
             "search_prev" => Self::SearchPrev,
@@ -90,6 +99,9 @@ impl Action {
             "prev_file" | "changed_prev" => Self::PrevFile,
             "toggle_split" => Self::ToggleSplit,
             "grep" | "find_in_project" => Self::Grep,
+            "jump_back" | "back" => Self::JumpBack,
+            "jump_forward" | "forward" => Self::JumpForward,
+            "toggle_jumps" | "jumps" => Self::ToggleJumps,
             _ => return None,
         })
     }
@@ -229,6 +241,11 @@ impl Keymap {
         add(ch('['), PrevFile);
         add(ch('s'), ToggleSplit);
         add(ctrl('f'), Grep);
+        // ジャンプ履歴：左右対称の ( / ) と、vim 風の Ctrl-O（戻る）。
+        add(ch('('), JumpBack);
+        add(ch(')'), JumpForward);
+        add(ctrl('o'), JumpBack);
+        add(ch('J'), ToggleJumps); // 右のジャンプ履歴ペイン表示切替
 
         Self { map }
     }

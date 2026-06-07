@@ -17,6 +17,8 @@ pub struct Symbol {
     pub kind: String,
     /// 0 始まりの行番号。
     pub line: usize,
+    /// 0 始まりの列（名前の開始位置、バイト基準）。ジャンプ時にカーソルを名前へ。
+    pub col: usize,
 }
 
 /// 対応言語の tags 設定一式。`TagsConfiguration` は `Send`/`Sync` でないため
@@ -86,20 +88,46 @@ impl LangConfigs {
                     .to_string(),
                 kind: config.syntax_type_name(tag.syntax_type_id).to_string(),
                 line: tag.span.start.row,
+                col: tag.span.start.column,
             });
         }
         out.sort_by_key(|s| s.line);
         out
     }
+
+    /// 1 ファイルの全タグを (名前, 0始まり行, 0始まり列, 定義か) で返す（索引構築用）。
+    /// `is_definition=false` は参照（呼び出し箇所など）。
+    pub fn file_tags(&self, path: &Path, source: &[u8]) -> Vec<(String, usize, usize, bool)> {
+        let Some(config) = self.config_for(path) else {
+            return Vec::new();
+        };
+        let mut ctx = TagsContext::new();
+        let Ok((tags, _)) = ctx.generate_tags(config, source, None) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for tag in tags.flatten() {
+            let name = String::from_utf8_lossy(source.get(tag.name_range).unwrap_or_default())
+                .to_string();
+            out.push((name, tag.span.start.row, tag.span.start.column, tag.is_definition));
+        }
+        out
+    }
 }
 
-/// プロジェクト全体の定義索引（`gd` 用）。初回利用時に走査する。
-type Def = (String, PathBuf, usize);
+/// プロジェクト全体の索引エントリ（名前, ファイル, 0始まり行, 0始まり列）。
+type Def = (String, PathBuf, usize, usize);
+
+/// 定義（`gd` 用）と参照（`gr` 用）の索引。
+struct Index {
+    defs: Vec<Def>,
+    refs: Vec<Def>,
+}
 
 enum State {
     Idle,
-    Building(Receiver<Vec<Def>>),
-    Ready(Vec<Def>),
+    Building(Receiver<Index>),
+    Ready(Index),
 }
 
 /// プロジェクト全体の定義索引（`gd` 用）。別スレッドで構築し UI を止めない。
@@ -124,7 +152,7 @@ impl ProjectIndex {
             thread::spawn(move || {
                 // LangConfigs は Send でないためスレッド内で生成する。
                 let configs = LangConfigs::new();
-                let _ = tx.send(collect_defs(&root, &configs));
+                let _ = tx.send(collect_index(&root, &configs));
             });
             self.state = State::Building(rx);
         }
@@ -134,14 +162,17 @@ impl ProjectIndex {
     pub fn poll(&mut self) -> bool {
         if let State::Building(rx) = &self.state {
             match rx.try_recv() {
-                Ok(defs) => {
-                    self.state = State::Ready(defs);
+                Ok(index) => {
+                    self.state = State::Ready(index);
                     return true;
                 }
                 Err(TryRecvError::Empty) => {}
                 // スレッドが落ちた等。空の Ready にして無限待ちを避ける。
                 Err(TryRecvError::Disconnected) => {
-                    self.state = State::Ready(Vec::new());
+                    self.state = State::Ready(Index {
+                        defs: Vec::new(),
+                        refs: Vec::new(),
+                    });
                     return true;
                 }
             }
@@ -153,21 +184,36 @@ impl ProjectIndex {
         matches!(self.state, State::Building(_))
     }
 
-    /// 名前に一致する定義位置（索引が未完了なら `None`）。
-    pub fn definition(&self, name: &str) -> Option<(PathBuf, usize)> {
+    /// 名前に一致する定義位置 (パス, 行, 列)（索引が未完了なら `None`）。
+    pub fn definition(&self, name: &str) -> Option<(PathBuf, usize, usize)> {
         match &self.state {
-            State::Ready(defs) => defs
+            State::Ready(idx) => idx
+                .defs
                 .iter()
-                .find(|(n, _, _)| n == name)
-                .map(|(_, p, l)| (p.clone(), *l)),
+                .find(|(n, _, _, _)| n == name)
+                .map(|(_, p, l, c)| (p.clone(), *l, *c)),
             _ => None,
+        }
+    }
+
+    /// 名前を参照している箇所（呼び出し元など）の一覧 (パス, 行, 列)。未完了なら空。
+    pub fn references(&self, name: &str) -> Vec<(PathBuf, usize, usize)> {
+        match &self.state {
+            State::Ready(idx) => idx
+                .refs
+                .iter()
+                .filter(|(n, _, _, _)| n == name)
+                .map(|(_, p, l, c)| (p.clone(), *l, *c))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 }
 
-/// プロジェクト配下の全定義を収集する（スレッド内で実行）。
-fn collect_defs(root: &Path, configs: &LangConfigs) -> Vec<Def> {
+/// プロジェクト配下の全定義・参照を収集する（スレッド内で実行）。
+fn collect_index(root: &Path, configs: &LangConfigs) -> Index {
     let mut defs = Vec::new();
+    let mut refs = Vec::new();
     for entry in WalkBuilder::new(root).build().flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
             continue;
@@ -176,11 +222,15 @@ fn collect_defs(root: &Path, configs: &LangConfigs) -> Vec<Def> {
         let Ok(source) = std::fs::read(path) else {
             continue;
         };
-        for sym in configs.file_symbols(path, &source) {
-            defs.push((sym.name, path.to_path_buf(), sym.line));
+        for (name, line, col, is_def) in configs.file_tags(path, &source) {
+            if is_def {
+                defs.push((name, path.to_path_buf(), line, col));
+            } else {
+                refs.push((name, path.to_path_buf(), line, col));
+            }
         }
     }
-    defs
+    Index { defs, refs }
 }
 
 #[cfg(test)]
@@ -211,9 +261,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             index.poll();
         }
-        let (path, _line) = index
+        let (path, _line, _col) = index
             .definition("ProjectIndex")
             .expect("ProjectIndex defined somewhere");
         assert_eq!(path.extension().unwrap(), "rs");
+    }
+
+    #[test]
+    fn project_index_collects_references() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut index = ProjectIndex::new(root.as_path());
+        index.start();
+        while index.is_building() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            index.poll();
+        }
+        // jump_to_code_line は app.rs 内で複数回呼ばれている。
+        let refs = index.references("jump_to_code_line");
+        assert!(!refs.is_empty(), "expected call sites for jump_to_code_line");
+        assert!(refs.iter().all(|(p, _, _)| p.extension().unwrap() == "rs"));
     }
 }

@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::app::{
-    App, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, SelRegion, ViewMode,
+    App, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, RefList, SelRegion, ViewMode,
 };
 use crate::diffview::LineMark;
 use crate::finder::Finder;
@@ -28,8 +28,20 @@ const SELECTION_BG: Color = Color::Rgb(55, 60, 95);
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [body, status] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
-    let [left, content_area] =
-        Layout::horizontal([Constraint::Length(32), Constraint::Min(0)]).areas(body);
+    // 左ペインは画面幅の約 1/3（深い階層でもファイル名が見えるよう）。
+    // 狭い端末では最低 32 桁、広い端末でも 70 桁までに収める。
+    let left_w = (body.width / 3).clamp(32, 70);
+    let [left, right] =
+        Layout::horizontal([Constraint::Length(left_w), Constraint::Min(0)]).areas(body);
+    // 右端にジャンプ履歴ペインを確保（表示 ON かつ十分広いとき）。残りが本文。
+    let (content_area, jumps_area) = if app.show_jumps && right.width >= 60 {
+        let jw = (right.width / 4).clamp(24, 36);
+        let [c, j] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(jw)]).areas(right);
+        (c, Some(j))
+    } else {
+        (right, None)
+    };
     let [tree_area, outline_area] =
         Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(left);
 
@@ -58,6 +70,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.ensure_diff_split();
 
     render_content(frame, content_area, app);
+    if let Some(jumps_area) = jumps_area {
+        render_jumps(frame, jumps_area, app);
+    }
     render_status(frame, status, app);
 
     if app.finder.active {
@@ -65,6 +80,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.grep.active {
         render_grep(frame, frame.area(), &app.grep);
+    }
+    if let Some(refs) = &app.refs {
+        render_refs(frame, frame.area(), refs);
     }
 
     // 端末カーソルをコード上の位置に表示。
@@ -566,6 +584,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("] [", "Next/Prev File"),
             ("/", find_word),
             ("gd", "def"),
+            ("gr", "refs"),
+            ("( )", "jump back/fwd"),
+            ("J", "jumps pane"),
             ("d", "diff"),
             ("v/V/y", "yank"),
             ("Y", "loc"),
@@ -682,6 +703,48 @@ fn render_grep(frame: &mut Frame, area: Rect, grep: &crate::grep::ProjectSearch)
     frame.render_widget(Paragraph::new(rows), list_area);
 }
 
+/// 参照（呼び出し元）一覧オーバーレイ。`rel:line  preview` を並べ、名前を強調。
+fn render_refs(frame: &mut Frame, area: Rect, refs: &RefList) {
+    let popup = centered_rect(area, 80, 70);
+    frame.render_widget(Clear, popup);
+
+    let title = format!(" References to `{}` — {} ", refs.name, refs.hits.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Green))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let h = inner.height as usize;
+    let max_start = refs.hits.len().saturating_sub(h);
+    let start = refs.selected.saturating_sub(h / 2).min(max_start);
+    let needle = refs.name.to_lowercase();
+
+    let rows: Vec<Line> = refs
+        .hits
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(h)
+        .map(|(i, hit)| {
+            let loc_style = if i == refs.selected {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let mut spans = vec![
+                Span::styled(format!("{}:{}", hit.rel, hit.line + 1), loc_style),
+                Span::raw("  "),
+            ];
+            spans.extend(highlight_match(&hit.preview, &needle));
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), inner);
+}
+
 /// プレビュー行内のマッチ部分（大文字小文字無視）を強調した Span 列を返す。
 fn highlight_match(text: &str, needle_lower: &str) -> Vec<Span<'static>> {
     let base = Style::default().fg(Color::Gray);
@@ -747,6 +810,42 @@ fn key(label: &str) -> Span<'static> {
 }
 
 /// フォーカス時に枠を強調するブロックを作る。
+/// 右端のジャンプ履歴ペイン。古い「戻る」先 → 現在地（▶）→「進む」先を縦に並べる。
+fn render_jumps(frame: &mut Frame, area: Rect, app: &App) {
+    let block = pane_block(" Jumps ", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.jumps_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from("(no jumps yet)").dim()),
+            inner,
+        );
+        return;
+    }
+
+    let rows = app.jump_trail();
+    let h = inner.height as usize;
+    // 現在地が中央付近に来るようスクロール。
+    let cur = rows.iter().position(|r| r.current).unwrap_or(0);
+    let max_start = rows.len().saturating_sub(h);
+    let start = cur.saturating_sub(h / 2).min(max_start);
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(start)
+        .take(h)
+        .map(|r| {
+            if r.current {
+                Line::from(vec!["▶ ".cyan(), r.label.clone().cyan().bold()])
+            } else {
+                Line::from(vec!["  ".into(), r.label.clone().gray()])
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
     let border_style = if focused {
         Style::default().fg(Color::Cyan)

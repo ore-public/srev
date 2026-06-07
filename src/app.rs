@@ -73,6 +73,52 @@ struct ChangedEntry {
     status: FileStatus,
 }
 
+/// ジャンプ履歴の 1 地点（ファイル＋カーソル位置）。
+#[derive(Clone, PartialEq, Eq)]
+struct JumpPos {
+    path: PathBuf,
+    line: usize,
+    col: usize,
+}
+
+/// ジャンプ履歴ペインに描く 1 行（ui へ渡す）。
+pub struct JumpRow {
+    /// `相対パス:行` 表記。
+    pub label: String,
+    /// 現在地（`▶`）か。
+    pub current: bool,
+}
+
+/// 参照（呼び出し元）一覧の 1 件。
+pub struct RefHit {
+    pub rel: String,
+    pub abs: PathBuf,
+    /// 0 始まりの行。
+    pub line: usize,
+    /// 0 始まりの列（名前の位置）。
+    pub col: usize,
+    pub preview: String,
+}
+
+/// `gr` で開く参照一覧オーバーレイの状態。
+pub struct RefList {
+    /// 検索した名前（タイトル表示用）。
+    pub name: String,
+    pub hits: Vec<RefHit>,
+    pub selected: usize,
+}
+
+impl RefList {
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.hits.len() {
+            self.selected += 1;
+        }
+    }
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+}
+
 /// `[`/`]` で順送りする対象リスト。
 #[derive(Clone, Copy)]
 enum NavList {
@@ -205,6 +251,14 @@ pub struct App {
     pub recenter: bool,
     /// visual mode の選択（コード表示時のみ有効）。
     selection: Option<Selection>,
+    /// ジャンプ履歴（戻る用＝飛ぶ前の位置スタック）。
+    jump_back: Vec<JumpPos>,
+    /// ジャンプ履歴（進む用）。
+    jump_forward: Vec<JumpPos>,
+    /// 右側のジャンプ履歴ペインを表示するか（既定 true、`J` で切替）。
+    pub show_jumps: bool,
+    /// 参照（呼び出し元）一覧オーバーレイ（`gr`）。None なら非表示。
+    pub refs: Option<RefList>,
     /// ステータス行に一時表示するメッセージ（yank 結果など）。
     pub flash: Option<String>,
     /// flash を表示し始めた時刻（一定時間で自動的に消す）。
@@ -253,6 +307,10 @@ impl App {
             diff_split: true,
             recenter: false,
             selection: None,
+            jump_back: Vec::new(),
+            jump_forward: Vec::new(),
+            show_jumps: true,
+            refs: None,
             flash: None,
             flash_at: None,
             all_files,
@@ -328,6 +386,10 @@ impl App {
             self.on_key_grep(key);
             return;
         }
+        if self.refs.is_some() {
+            self.on_key_refs(key);
+            return;
+        }
         if self.tree_filter.is_some() {
             self.on_key_tree_filter(key);
             return;
@@ -345,6 +407,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('g') => self.dispatch(Action::Top),
                     KeyCode::Char('d') => self.dispatch(Action::GotoDef),
+                    KeyCode::Char('r') => self.dispatch(Action::GotoReferences),
                     _ => {}
                 }
             }
@@ -380,6 +443,9 @@ impl App {
             ToggleDiff => self.toggle_view_mode(),
             FuzzyFind => self.finder.open(),
             Grep => self.grep.open(),
+            JumpBack => self.go_back(),
+            JumpForward => self.go_forward(),
+            ToggleJumps => self.show_jumps = !self.show_jumps,
             Reload => self.reload(),
             // 差分モードでは変更ファイル一覧、コードモードでは全ファイルを順送り。
             NextFile => self.navigate_files(self.nav_list(), true),
@@ -458,13 +524,14 @@ impl App {
                 }
             }
             Activate | Right => {
-                let line = self
+                let pos = self
                     .open
                     .as_ref()
                     .and_then(|o| o.outline.get(o.outline_selected))
-                    .map(|s| s.line);
-                if let Some(line) = line {
-                    self.jump_to_code_line(line);
+                    .map(|s| (s.line, s.col));
+                if let Some((line, col)) = pos {
+                    self.record_jump_origin();
+                    self.jump_to_code_pos(line, col);
                 }
             }
             Find => self.open_outline_filter(),
@@ -534,15 +601,22 @@ impl App {
                     o.cursor_col = o.line_len(o.cursor_line).saturating_sub(1)
                 }
             }
-            Top => self.cursor_to(0),
+            Top => {
+                self.record_jump_origin();
+                self.cursor_to(0);
+                self.recenter = true;
+            }
             Bottom => {
-                if let Some(o) = self.open.as_ref() {
-                    self.cursor_to(o.last_line());
+                if let Some(last) = self.open.as_ref().map(|o| o.last_line()) {
+                    self.record_jump_origin();
+                    self.cursor_to(last);
+                    self.recenter = true;
                 }
             }
             HalfPageDown => self.move_v(15),
             HalfPageUp => self.move_v(-15),
             GotoDef => self.goto_definition(),
+            GotoReferences => self.goto_references(),
             Find => self.search_input = Some(String::new()),
             SearchNext => self.search_jump(true),
             SearchPrev => self.search_jump(false),
@@ -584,6 +658,7 @@ impl App {
                 if let Some((path, line)) = self.grep.selected_target() {
                     let query = self.grep.query.clone();
                     self.grep.close();
+                    self.record_jump_origin(); // 飛ぶ前（今のファイル）を履歴へ
                     self.open_file(&path);
                     // 検索語を / にも引き継ぎ、開いた先で n/N で追えるようにする。
                     self.search_query = query;
@@ -717,6 +792,7 @@ impl App {
                 let target = self.filter_selected(false);
                 self.outline_filter = None;
                 if let Some(FilterTarget::Line(line)) = target {
+                    self.record_jump_origin();
                     self.jump_to_code_line(line);
                 }
             }
@@ -941,6 +1017,103 @@ impl App {
         self.jump_to_line(line);
     }
 
+    /// 行＋列へジャンプ（カーソルをシンボル名の上に置く）。gd/gr/アウトライン用。
+    fn jump_to_code_pos(&mut self, line: usize, col: usize) {
+        self.jump_to_code_line(line);
+        if let Some(o) = self.open.as_mut() {
+            o.cursor_col = col.min(o.line_len(o.cursor_line).saturating_sub(1));
+        }
+    }
+
+    /// ジャンプ履歴がまだ無いか（戻る/進む両方空）。
+    pub fn jumps_empty(&self) -> bool {
+        self.jump_back.is_empty() && self.jump_forward.is_empty()
+    }
+
+    /// ジャンプ履歴の経路（古い戻る → 現在地 → 進む）を ui 用に返す。
+    pub fn jump_trail(&self) -> Vec<JumpRow> {
+        let fmt = |jp: &JumpPos| {
+            let rel = jp.path.strip_prefix(&self.root).unwrap_or(&jp.path);
+            JumpRow {
+                label: format!("{}:{}", rel.to_string_lossy(), jp.line + 1),
+                current: false,
+            }
+        };
+        let mut rows = Vec::new();
+        for jp in &self.jump_back {
+            rows.push(fmt(jp));
+        }
+        if let Some(cur) = self.current_pos() {
+            let mut row = fmt(&cur);
+            row.current = true;
+            rows.push(row);
+        }
+        // 進む側は「次に進む先」を現在地のすぐ下に来るよう逆順で。
+        for jp in self.jump_forward.iter().rev() {
+            rows.push(fmt(jp));
+        }
+        rows
+    }
+
+    /// 現在のカーソル位置（開いているファイル）を返す。
+    fn current_pos(&self) -> Option<JumpPos> {
+        self.open.as_ref().map(|o| JumpPos {
+            path: o.path.clone(),
+            line: o.cursor_line,
+            col: o.cursor_col,
+        })
+    }
+
+    /// ジャンプ直前の位置を履歴に積む（進む履歴はクリア）。
+    /// 各ジャンプ操作が「飛ぶ前」に呼ぶ。
+    fn record_jump_origin(&mut self) {
+        if let Some(pos) = self.current_pos() {
+            if self.jump_back.last() != Some(&pos) {
+                self.jump_back.push(pos);
+            }
+            self.jump_forward.clear();
+        }
+    }
+
+    /// ジャンプ履歴を戻る（飛ぶ前の位置へ）。
+    fn go_back(&mut self) {
+        let Some(target) = self.jump_back.pop() else {
+            self.flash = Some("no earlier jump".into());
+            return;
+        };
+        if let Some(cur) = self.current_pos() {
+            self.jump_forward.push(cur);
+        }
+        self.go_to_pos(target);
+    }
+
+    /// ジャンプ履歴を進む。
+    fn go_forward(&mut self) {
+        let Some(target) = self.jump_forward.pop() else {
+            self.flash = Some("no later jump".into());
+            return;
+        };
+        if let Some(cur) = self.current_pos() {
+            self.jump_back.push(cur);
+        }
+        self.go_to_pos(target);
+    }
+
+    /// 履歴の地点へ移動する（別ファイルなら開いてから）。
+    fn go_to_pos(&mut self, pos: JumpPos) {
+        let same = self.open.as_ref().is_some_and(|o| o.path == pos.path);
+        if !same {
+            self.open_file(&pos.path);
+        }
+        self.view_mode = ViewMode::Code;
+        self.focus = Focus::Content;
+        self.cursor_to(pos.line);
+        if let Some(o) = self.open.as_mut() {
+            o.cursor_col = pos.col.min(o.line_len(o.cursor_line).saturating_sub(1));
+        }
+        self.recenter = true;
+    }
+
     /// カーソル下の語の定義へジャンプする。索引が未完了なら知らせる。
     fn goto_definition(&mut self) {
         let Some(word) = self.open.as_ref().and_then(|o| o.word_under_cursor()) else {
@@ -948,12 +1121,13 @@ impl App {
         };
         self.index.start(); // 念のため（未開始なら開始）
         match self.index.definition(&word) {
-            Some((path, line)) => {
+            Some((path, line, col)) => {
+                self.record_jump_origin(); // 飛ぶ前の位置を履歴へ
                 let same = self.open.as_ref().is_some_and(|o| o.path == path);
                 if !same {
                     self.open_file(&path);
                 }
-                self.jump_to_code_line(line);
+                self.jump_to_code_pos(line, col); // カーソルを名前の上へ
             }
             None => {
                 self.flash = Some(if self.index.is_building() {
@@ -962,6 +1136,94 @@ impl App {
                     format!("no definition: {word}")
                 });
             }
+        }
+    }
+
+    /// カーソル下の語の参照（呼び出し元など）一覧をオーバーレイで開く。
+    /// 名前ベースのため、同名シンボルも含まれる近似一覧。
+    fn goto_references(&mut self) {
+        let Some(word) = self.open.as_ref().and_then(|o| o.word_under_cursor()) else {
+            return;
+        };
+        self.index.start();
+        if self.index.is_building() {
+            self.flash = Some("indexing… (retry gr when ready)".into());
+            return;
+        }
+        let locs = self.index.references(&word);
+        if locs.is_empty() {
+            self.flash = Some(format!("no references: {word}"));
+            return;
+        }
+        // 同じファイルは 1 回だけ読んでプレビュー行を引く。
+        let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let mut hits = Vec::new();
+        for (path, line, col) in locs {
+            let lines = cache.entry(path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&path)
+                    .map(|s| s.lines().map(|l| l.to_string()).collect())
+                    .unwrap_or_default()
+            });
+            let preview = lines.get(line).map(|l| l.trim().to_string()).unwrap_or_default();
+            let rel = path
+                .strip_prefix(&self.root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            hits.push(RefHit {
+                rel,
+                abs: path,
+                line,
+                col,
+                preview,
+            });
+        }
+        hits.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
+        self.refs = Some(RefList {
+            name: word,
+            hits,
+            selected: 0,
+        });
+    }
+
+    fn on_key_refs(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.refs = None,
+            KeyCode::Enter => {
+                let target = self
+                    .refs
+                    .as_ref()
+                    .and_then(|r| r.hits.get(r.selected))
+                    .map(|h| (h.abs.clone(), h.line, h.col));
+                if let Some((path, line, col)) = target {
+                    self.refs = None;
+                    self.record_jump_origin(); // 飛ぶ前を履歴へ
+                    self.open_file(&path);
+                    self.jump_to_code_pos(line, col);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(r) = self.refs.as_mut() {
+                    r.move_down()
+                }
+            }
+            KeyCode::Up => {
+                if let Some(r) = self.refs.as_mut() {
+                    r.move_up()
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if let Some(r) = self.refs.as_mut() {
+                    r.move_down()
+                }
+            }
+            KeyCode::Char('p') if ctrl => {
+                if let Some(r) = self.refs.as_mut() {
+                    r.move_up()
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1001,6 +1263,7 @@ impl App {
             }
         }
         if let Some(idx) = found {
+            self.record_jump_origin(); // 飛ぶ前の位置を履歴へ（カーソルはまだ動かしていない）
             if let Some(o) = self.open.as_mut() {
                 o.cursor_line = idx;
                 o.cursor_col = 0;
@@ -1660,6 +1923,117 @@ fn c() {}
         let _ = std::fs::remove_dir_all(&dir);
         assert!(has_marker, "no change marker rendered");
         assert!(max_run >= 10, "changed-line background not filled (max run = {max_run})");
+    }
+
+    #[test]
+    fn goto_definition_lands_cursor_on_symbol_name() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone());
+        while app.index.is_building() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.index.poll();
+        }
+        app.open_file(&root.join("src/app.rs"));
+        // ProjectIndex の使用箇所にカーソルを置く
+        let pos = app
+            .open
+            .as_ref()
+            .unwrap()
+            .raw_lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| l.find("ProjectIndex").map(|c| (i, c + 2)));
+        let (li, col) = pos.expect("ProjectIndex used in app.rs");
+        if let Some(o) = app.open.as_mut() {
+            o.cursor_line = li;
+            o.cursor_col = col;
+        }
+        app.goto_definition();
+        // 定義へ飛んだ後、カーソルがシンボル名の上にある（gr がそのまま効く）
+        assert_eq!(
+            app.open.as_ref().unwrap().word_under_cursor().as_deref(),
+            Some("ProjectIndex"),
+        );
+    }
+
+    #[test]
+    fn refs_overlay_enter_jumps_and_closes() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone());
+        app.open_file(&root.join("src/main.rs"));
+        let target = root.join("src/app.rs");
+        app.refs = Some(RefList {
+            name: "jump_to_code_line".into(),
+            hits: vec![RefHit {
+                rel: "src/app.rs".into(),
+                abs: target.clone(),
+                line: 50,
+                col: 0,
+                preview: "self.jump_to_code_line(line);".into(),
+            }],
+            selected: 0,
+        });
+        app.on_key_refs(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.refs.is_none(), "overlay should close");
+        assert_eq!(app.open.as_ref().unwrap().path, target);
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 50);
+        // 飛ぶ前（main.rs）が履歴に積まれている → 戻れる
+        app.go_back();
+        assert!(app.open.as_ref().unwrap().path.ends_with("main.rs"));
+    }
+
+    #[test]
+    fn jump_history_back_and_forward() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone());
+        app.open_file(&root.join("src/app.rs"));
+        app.cursor_to(10);
+        // gd 相当：飛ぶ前(10)を記録して 100 へ
+        app.record_jump_origin();
+        app.jump_to_code_line(100);
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 100);
+        // 戻る → 10
+        app.go_back();
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 10);
+        // 進む → 100
+        app.go_forward();
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 100);
+        // これ以上は進めない（位置は変わらず、flash で通知）
+        app.go_forward();
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 100);
+        assert!(app.flash.is_some());
+    }
+
+    #[test]
+    fn jumps_pane_renders_trail_and_toggles() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone());
+        app.open_file(&root.join("src/app.rs"));
+        app.cursor_to(10);
+        app.record_jump_origin();
+        app.jump_to_code_line(100);
+
+        let buf_text = |app: &mut App| -> String {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+            term.draw(|f| crate::ui::draw(f, app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let text = buf_text(&mut app);
+        assert!(text.contains("Jumps"), "jumps pane title missing");
+        assert!(text.contains("src/app.rs:101"), "current jump entry missing");
+
+        // J でトグル → 消える
+        app.show_jumps = false;
+        let text2 = buf_text(&mut app);
+        assert!(!text2.contains("Jumps"), "jumps pane should be hidden");
     }
 
     #[test]

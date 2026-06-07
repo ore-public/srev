@@ -12,6 +12,8 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Working tree vs HEAD diff** on demand with `d` — review uncommitted changes
 - **Toggle diff ⇄ full code** with `d`, preserving the corresponding line position
 - **Vim-like cursor** for reading code; **jump to definition** under cursor with `gd`
+- **Find references** with `gr` — list call sites of the symbol under the cursor across the project and jump to one (name-based, approximate)
+- **Jump history** — every jump (`gd`, outline, project search, `gg`/`G`, in-file search) remembers where you came from; go back/forward with `(` / `)` (works across files). A **jump-history pane on the right** visualizes the trail with the current position highlighted (toggle with `J`)
 - **Visual mode** (`v`/`V`) to select a range, then `y` to copy to clipboard
 - **Outline pane** (bottom-left) lists symbols in the open file for quick navigation
 - **In-file search** (`/` → `Enter`, `n`/`N` for next/previous match)
@@ -105,6 +107,8 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `Ctrl-F` | Project-wide content search (substring); `Enter` jumps to the matching line |
 | `Ctrl-R` | Reload (file, git state, tree, index — cursor kept) |
 | `]` / `[` | Open next / previous file (code mode = all files by path; diff mode = changed files) |
+| `(` / `)` | Jump history: go back / forward through jumps (`Ctrl-O` also goes back) |
+| `J` | Toggle the right-side jump-history pane (shown by default) |
 
 #### Tree (code mode) / Changed-file list (diff mode)
 
@@ -133,6 +137,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `gg` / `G` | File start / end |
 | `Ctrl-d` / `Ctrl-u` | Half-page scroll |
 | `gd` | Jump to definition of word under cursor |
+| `gr` | List references (call sites) of word under cursor; `Enter` jumps (`↑`/`↓` or `Ctrl-n`/`Ctrl-p` to move, `Esc` to close) |
 | `v` / `V` | Start visual mode (character / line) |
 | `y` | Copy selection to clipboard |
 | `Y` | Copy location to clipboard (no selection = `path:line:col`; single-line = `path:line`; multi-line = `path:start-end`) |
@@ -140,7 +145,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `/` → type → `Enter` | In-file search |
 | `n` / `N` | Next / previous match |
 
-> The `g` prefix for `gg` and `gd` is fixed and cannot be remapped in the config file.
+> The `g` prefix for `gg`, `gd` and `gr` is fixed and cannot be remapped in the config file.
 
 #### Content pane — diff mode
 
@@ -212,6 +217,7 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `line_end` | Line end |
 | `toggle_diff` | Toggle diff ⇄ code |
 | `goto_def` | Jump to definition |
+| `goto_references` | List references (call sites) of the symbol under cursor |
 | `find` | Start in-file search |
 | `search_next` | Next match |
 | `search_prev` | Previous match |
@@ -226,6 +232,9 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `prev_file` | Open previous file (code = all files; diff = changed files) |
 | `toggle_split` | Toggle unified ⇄ side-by-side diff |
 | `grep` | Project-wide content search |
+| `jump_back` | Jump history: go back |
+| `jump_forward` | Jump history: go forward |
+| `toggle_jumps` | Toggle the jump-history pane |
 
 Use `"none"` to disable a key binding.
 The `g` prefix for `gg` / `gd` cannot be remapped.
@@ -240,7 +249,7 @@ The `g` prefix for `gg` / `gd` cannot be remapped.
 **Markdown** is supported via tree-sitter's block + inline grammars, and code
 inside fenced blocks (```rust, etc.) is highlighted per language when supported.
 
-### Code Jump (`gd`) and Outline
+### Code Jump (`gd` / `gr`) and Outline
 
 Supported for **Rust, Python, JavaScript, Go, Ruby, C** only.
 
