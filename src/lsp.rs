@@ -624,6 +624,55 @@ mod tests {
         }
     }
 
+    /// intelephense を実起動して PHP の定義解決まで通すエンドツーエンド検証（手動）。
+    #[test]
+    #[ignore = "spawns intelephense; run with --ignored"]
+    fn intelephense_resolves_definition() {
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("srev_php_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line0 = "<?php";
+        let line1 = "function target() { return 1; }";
+        let line2 = "$x = target();";
+        let src = format!("{line0}\n{line1}\n{line2}\n");
+        let main_php = dir.join("main.php");
+        std::fs::write(&main_php, &src).unwrap();
+
+        let mut mgr = LspManager::new(&dir);
+        if mgr.ensure_open(&main_php, "php", &src) {
+            eprintln!("[php-e2e] intelephense unavailable; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let ch = line2.find("target()").unwrap() as u32;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut pending = HashSet::new();
+        let mut last_req = Instant::now() - Duration::from_secs(10);
+        loop {
+            if last_req.elapsed() > Duration::from_secs(2) {
+                if let Some(id) = mgr.request_definition(&main_php, 2, ch) {
+                    pending.insert(id);
+                }
+                last_req = Instant::now();
+            }
+            for (rid, locs) in mgr.poll() {
+                if pending.contains(&rid) && !locs.is_empty() {
+                    assert_eq!(locs[0].line, 1, "target() defined on line 1");
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+            }
+            if Instant::now() > deadline {
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("intelephense did not resolve definition within timeout");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn user_config_overrides_command_and_disables() {
         let mut langs = default_langs();
