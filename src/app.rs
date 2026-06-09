@@ -122,20 +122,43 @@ impl RefList {
     }
 }
 
-/// ブランチ切替ピッカーのオーバーレイ状態（`B`）。
+/// ブランチ切替ピッカーのオーバーレイ状態（`Ctrl-V`）。あいまい絞り込み対応。
 pub struct BranchList {
+    /// 全ブランチ（fetch 時のスナップショット）。
     pub entries: Vec<BranchEntry>,
+    /// 絞り込みクエリ。
+    pub query: String,
+    /// クエリでランキングした `entries` への添字列（表示順）。
+    pub results: Vec<usize>,
+    /// `results` 内の選択位置。
     pub selected: usize,
 }
 
 impl BranchList {
+    pub fn new(entries: Vec<BranchEntry>) -> Self {
+        let results = (0..entries.len()).collect();
+        // 既定の選択は現在ブランチ。
+        let selected = entries.iter().position(|e| e.is_head).unwrap_or(0);
+        Self {
+            entries,
+            query: String::new(),
+            results,
+            selected,
+        }
+    }
+
     pub fn move_down(&mut self) {
-        if self.selected + 1 < self.entries.len() {
+        if self.selected + 1 < self.results.len() {
             self.selected += 1;
         }
     }
     pub fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// 現在選択中のブランチ（絞り込み結果が空なら `None`）。
+    pub fn current(&self) -> Option<&BranchEntry> {
+        self.results.get(self.selected).and_then(|&i| self.entries.get(i))
     }
 }
 
@@ -352,6 +375,8 @@ pub struct App {
     on_default_branch: bool,
     /// 基準デフォルトブランチ名（タイトル表示用）。
     default_branch_label: String,
+    /// 現在チェックアウト中のブランチ名（ステータスバー表示用にキャッシュ）。
+    branch: Option<String>,
     git: Option<GitInfo>,
     highlighter: CodeHighlighter,
     keymap: Keymap,
@@ -376,6 +401,7 @@ impl App {
         let mut index = ProjectIndex::new(&root);
         index.start(); // 起動直後にバックグラウンド構築を開始
         let lsp = LspManager::new(&root);
+        let branch = git.as_ref().and_then(|g| g.current_branch());
         let statuses = git.as_ref().map(|g| g.statuses()).unwrap_or_default();
         let changed = changed_entries(&statuses, &root);
         Self {
@@ -419,6 +445,7 @@ impl App {
             commits_loaded: false,
             on_default_branch: false,
             default_branch_label: String::new(),
+            branch,
             git,
             highlighter: CodeHighlighter::new(),
             keymap: Keymap::load(),
@@ -1598,10 +1625,24 @@ impl App {
             self.flash = Some("no branches".into());
             return;
         }
-        let selected = entries.iter().position(|e| e.is_head).unwrap_or(0);
-        self.branches = Some(BranchList { entries, selected });
+        self.branches = Some(BranchList::new(entries));
         if !fetched {
             self.flash = Some("origin fetch failed (showing local)".into());
+        }
+    }
+
+    /// クエリでブランチ一覧を絞り込み直す（選択は先頭へ）。
+    fn recompute_branch_filter(&mut self) {
+        let results = {
+            let Some(b) = self.branches.as_ref() else {
+                return;
+            };
+            let labels: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
+            self.fuzzy.rank(&b.query, &labels)
+        };
+        if let Some(b) = self.branches.as_mut() {
+            b.results = results;
+            b.selected = 0;
         }
     }
 
@@ -1613,7 +1654,7 @@ impl App {
                 let target = self
                     .branches
                     .as_ref()
-                    .and_then(|b| b.entries.get(b.selected))
+                    .and_then(|b| b.current())
                     .map(|e| (e.target.clone(), e.is_head));
                 self.branches = None;
                 if let Some((target, is_head)) = target {
@@ -1631,6 +1672,7 @@ impl App {
                     }
                 }
             }
+            // ナビゲーションは矢印 / Ctrl-n,p（文字はクエリ入力に使うため）。
             KeyCode::Down => {
                 if let Some(b) = self.branches.as_mut() {
                     b.move_down()
@@ -1650,6 +1692,19 @@ impl App {
                 if let Some(b) = self.branches.as_mut() {
                     b.move_up()
                 }
+            }
+            // あいまい絞り込み入力。
+            KeyCode::Backspace => {
+                if let Some(b) = self.branches.as_mut() {
+                    b.query.pop();
+                }
+                self.recompute_branch_filter();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(b) = self.branches.as_mut() {
+                    b.query.push(c);
+                }
+                self.recompute_branch_filter();
             }
             _ => {}
         }
@@ -1930,6 +1985,7 @@ impl App {
     /// AI 編集後などに、ファイル内容・git 状態・ツリー・索引を読み直す。
     fn reload(&mut self) {
         self.statuses = self.git.as_ref().map(|g| g.statuses()).unwrap_or_default();
+        self.branch = self.git.as_ref().and_then(|g| g.current_branch());
         self.changed = changed_entries(&self.statuses, &self.root);
         if self.changed_selected >= self.changed.len() {
             self.changed_selected = self.changed.len().saturating_sub(1);
@@ -2192,6 +2248,12 @@ impl App {
             })
             .collect();
         (title, rows)
+    }
+
+    /// ステータスバー表示用の現在ブランチ名（git リポジトリでなければ `None`）。
+    pub fn branch_label(&self) -> Option<String> {
+        self.git.as_ref()?;
+        Some(self.branch.clone().unwrap_or_else(|| "(detached)".into()))
     }
 
     /// ファイルを読み込み、ハイライト・差分・アウトラインを用意して開く。
@@ -2810,18 +2872,49 @@ fn c() {}
             is_head: head,
             is_remote: false,
         };
-        let mut bl = BranchList {
-            entries: vec![entry("main", true), entry("feature", false)],
-            selected: 0,
-        };
+        let mut bl = BranchList::new(vec![entry("main", true), entry("feature", false)]);
+        assert_eq!(bl.results, vec![0, 1]);
+        assert_eq!(bl.current().map(|e| e.display.as_str()), Some("main"));
         bl.move_down();
         assert_eq!(bl.selected, 1);
+        assert_eq!(bl.current().map(|e| e.display.as_str()), Some("feature"));
         bl.move_down(); // 末尾でクランプ
         assert_eq!(bl.selected, 1);
         bl.move_up();
         assert_eq!(bl.selected, 0);
         bl.move_up(); // 先頭でクランプ
         assert_eq!(bl.selected, 0);
+    }
+
+    #[test]
+    fn branch_filter_narrows_results() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let entry = |n: &str| BranchEntry {
+            display: n.to_string(),
+            target: n.to_string(),
+            is_head: false,
+            is_remote: false,
+        };
+        app.branches = Some(BranchList::new(vec![
+            entry("main"),
+            entry("feature-login"),
+            entry("feature-logout"),
+            entry("hotfix"),
+        ]));
+        if let Some(b) = app.branches.as_mut() {
+            b.query = "log".into();
+        }
+        app.recompute_branch_filter();
+        let b = app.branches.as_ref().unwrap();
+        let shown: Vec<&str> = b
+            .results
+            .iter()
+            .map(|&i| b.entries[i].display.as_str())
+            .collect();
+        assert!(shown.contains(&"feature-login"), "{shown:?}");
+        assert!(shown.contains(&"feature-logout"), "{shown:?}");
+        assert!(!shown.contains(&"main"), "{shown:?}");
+        assert!(!shown.contains(&"hotfix"), "{shown:?}");
     }
 
     #[test]

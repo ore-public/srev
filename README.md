@@ -25,7 +25,7 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Syntax highlighting** for 200+ languages via syntect (incl. PHP, HAML, TOML, TypeScript…) — **Markdown also highlights code inside fenced blocks** per language
 - **Diff review navigation** — jump between hunks with `n`/`N`, between changed files with `]`/`[`. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
 - **Commit view** (`c`) — the left pane lists commits that differ from the default branch (`default..HEAD`), or the full log when you're on the default branch. Pick a commit to see its changed files (bottom-left) and the selected file's side-by-side diff
-- **Branch switching** (`Ctrl-V`) — fetches `origin` first, then shows local and remote branches; selecting one checks it out (via `git`, auto-creating a tracking branch for remotes) and reloads automatically
+- **Branch switching** (`Ctrl-V`) — fetches `origin` first, then shows local and remote branches with **type-to-filter** fuzzy search; selecting one checks it out (via `git`, auto-creating a tracking branch for remotes) and reloads automatically. The **current branch** is always shown as a chip at the bottom-right of the status bar
 - File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked). Dotfiles and `.gitignore`d files are listed too, shown **dimmed**; ignored directories (e.g. `target/`) appear but aren't descended into, and the `.git` directory is excluded
 - **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD
 - Single binary. Builds on Linux / macOS / Windows

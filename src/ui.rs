@@ -572,6 +572,8 @@ fn place_cursor(frame: &mut Frame, content_area: Rect, app: &App) {
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+    // 現在ブランチを右端のチップとして常時表示し、残りを以降の描画に使う。
+    let area = render_branch_chip(frame, area, app);
     if let Some(buf) = &app.search_input {
         let line = Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
@@ -676,6 +678,29 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         used += w;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// ステータスバー右端に現在ブランチのチップを描画し、左側の残り領域を返す。
+fn render_branch_chip(frame: &mut Frame, area: Rect, app: &App) -> Rect {
+    let Some(branch) = app.branch_label() else {
+        return area;
+    };
+    let text = format!(" ⎇ {branch} ");
+    let w = text.chars().count() as u16;
+    // 狭い端末では出さない（ヒントを優先）。
+    if area.width <= w + 8 {
+        return area;
+    }
+    let [left, chip] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(w)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )),
+        chip,
+    );
+    left
 }
 
 /// 画面中央にあいまい検索オーバーレイを描画する。
@@ -812,7 +837,11 @@ fn render_branches(frame: &mut Frame, area: Rect, branches: &BranchList) {
     let popup = centered_rect(area, 60, 70);
     frame.render_widget(Clear, popup);
 
-    let title = format!(" Switch branch — {} (Enter: checkout) ", branches.entries.len());
+    let title = format!(
+        " Switch branch — {}/{} (type to filter, Enter: checkout) ",
+        branches.results.len(),
+        branches.entries.len()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -821,18 +850,30 @@ fn render_branches(frame: &mut Frame, area: Rect, branches: &BranchList) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let h = inner.height as usize;
-    let max_start = branches.entries.len().saturating_sub(h);
+    // 先頭に絞り込みクエリ行、その下に結果リスト。
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(branches.query.clone()),
+        ])),
+        query_area,
+    );
+
+    let h = list_area.height as usize;
+    let max_start = branches.results.len().saturating_sub(h);
     let start = branches.selected.saturating_sub(h / 2).min(max_start);
 
     let rows: Vec<Line> = branches
-        .entries
+        .results
         .iter()
         .enumerate()
         .skip(start)
         .take(h)
-        .map(|(i, e)| {
-            let selected = i == branches.selected;
+        .filter_map(|(ri, &ei)| {
+            let e = branches.entries.get(ei)?;
+            let selected = ri == branches.selected;
             // 先頭マーカー: 現在ブランチ `*`、それ以外は空白。
             let marker = if e.is_head { "* " } else { "  " };
             let name_style = if selected {
@@ -844,13 +885,13 @@ fn render_branches(frame: &mut Frame, area: Rect, branches: &BranchList) {
             } else {
                 Style::default().fg(Color::White)
             };
-            Line::from(vec![
+            Some(Line::from(vec![
                 Span::styled(marker, Style::default().fg(Color::Green)),
                 Span::styled(e.display.clone(), name_style),
-            ])
+            ]))
         })
         .collect();
-    frame.render_widget(Paragraph::new(rows), inner);
+    frame.render_widget(Paragraph::new(rows), list_area);
 }
 
 /// プレビュー行内のマッチ部分（大文字小文字無視）を強調した Span 列を返す。
