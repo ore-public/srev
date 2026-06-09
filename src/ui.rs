@@ -195,7 +195,14 @@ fn render_list_pane(
 }
 
 fn render_outline(frame: &mut Frame, area: Rect, pane: &OutlinePane, focused: bool) {
-    let block = pane_block("Symbols", focused);
+    // 抽出元（LSP / tree-sitter）をタイトルに併記する。
+    let title = match pane {
+        OutlinePane::List {
+            source: Some(s), ..
+        } => format!("Symbols · {s}"),
+        _ => "Symbols".to_string(),
+    };
+    let block = pane_block(&title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -203,7 +210,7 @@ fn render_outline(frame: &mut Frame, area: Rect, pane: &OutlinePane, focused: bo
         OutlinePane::Empty(msg) => {
             frame.render_widget(Paragraph::new(Line::from(*msg).dim()), inner);
         }
-        OutlinePane::List { query, rows } => {
+        OutlinePane::List { query, rows, .. } => {
             let body = if let Some(q) = query {
                 let [q_area, list_area] =
                     Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);

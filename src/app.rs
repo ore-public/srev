@@ -14,7 +14,7 @@ use crate::git::{FileStatus, GitInfo};
 use crate::grep::ProjectSearch;
 use crate::highlight::CodeHighlighter;
 use crate::keymap::{Action, Chord, Keymap};
-use crate::lsp::{self, Loc, LspManager};
+use crate::lsp::{self, Loc, LspManager, Reply, SymInfo};
 use crate::tags::{LangConfigs, ProjectIndex, Symbol};
 use crate::tree::Tree;
 
@@ -147,12 +147,30 @@ pub struct ListRow {
     pub selected: bool,
 }
 
+/// アウトライン（シンボル一覧）を何で抽出したか。Symbols ペインのタイトルに表示する。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OutlineSource {
+    TreeSitter,
+    Lsp,
+}
+
+impl OutlineSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            OutlineSource::TreeSitter => "tree-sitter",
+            OutlineSource::Lsp => "LSP",
+        }
+    }
+}
+
 /// アウトラインペインの描画指示。
 pub enum OutlinePane {
     Empty(&'static str),
     List {
         query: Option<String>,
         rows: Vec<OutlineRow>,
+        /// 抽出元のラベル（"LSP" / "tree-sitter"）。タイトルに併記する。
+        source: Option<&'static str>,
     },
 }
 
@@ -178,6 +196,8 @@ pub struct OpenFile {
     pub cursor_col: usize,
     /// このファイルのシンボル定義一覧（アウトライン）。
     pub outline: Vec<Symbol>,
+    /// アウトラインの抽出元（tree-sitter 即時表示 → LSP で差し替わる）。
+    pub outline_source: OutlineSource,
     pub outline_selected: usize,
     /// 各行の変更印（HEAD との差分、コードビューの gutter 用）。
     pub change_marks: Vec<crate::diffview::LineMark>,
@@ -293,6 +313,10 @@ pub struct App {
     lsp: LspManager,
     /// 送信済みで応答待ちの LSP ナビゲーション要求（要求 ID → 内容）。
     pending_nav: HashMap<i64, PendingNav>,
+    /// 送信済みで応答待ちの documentSymbol 要求（要求 ID → 対象ファイル）。
+    pending_outline: HashMap<i64, PathBuf>,
+    /// LSP アウトラインを取得したいファイル（サーバー準備でき次第 documentSymbol を送る）。
+    outline_want: Option<PathBuf>,
     git: Option<GitInfo>,
     highlighter: CodeHighlighter,
     keymap: Keymap,
@@ -350,6 +374,8 @@ impl App {
             index,
             lsp,
             pending_nav: HashMap::new(),
+            pending_outline: HashMap::new(),
+            outline_want: None,
             git,
             highlighter: CodeHighlighter::new(),
             keymap: Keymap::load(),
@@ -943,6 +969,8 @@ impl App {
 
     /// アウトラインペインの描画指示。
     pub fn outline_pane(&mut self, limit: usize) -> OutlinePane {
+        // 抽出元ラベル（フィルタ表示でも開いているファイルのものを引き継ぐ）。
+        let source = self.open.as_ref().map(|o| o.outline_source.label());
         if self.outline_filter.is_some() {
             let App {
                 outline_filter,
@@ -966,6 +994,7 @@ impl App {
             return OutlinePane::List {
                 query: Some(f.query.clone()),
                 rows,
+                source,
             };
         }
 
@@ -988,7 +1017,11 @@ impl App {
                 selected: i == open.outline_selected,
             })
             .collect();
-        OutlinePane::List { query: None, rows }
+        OutlinePane::List {
+            query: None,
+            rows,
+            source,
+        }
     }
 
     // --- カーソル / ジャンプ補助 ---
@@ -1213,14 +1246,25 @@ impl App {
 
     /// LSP 応答の取り込みとタイムアウト処理（毎フレーム呼ぶ）。
     fn poll_lsp(&mut self) {
-        for (id, locs) in self.lsp.poll() {
-            if let Some(p) = self.pending_nav.remove(&id) {
-                match p.kind {
-                    NavKind::Def => self.apply_definition(p.word, locs),
-                    NavKind::Refs => self.apply_references(p.word, locs),
+        for (id, reply) in self.lsp.poll() {
+            match reply {
+                Reply::Locations(locs) => {
+                    if let Some(p) = self.pending_nav.remove(&id) {
+                        match p.kind {
+                            NavKind::Def => self.apply_definition(p.word, locs),
+                            NavKind::Refs => self.apply_references(p.word, locs),
+                        }
+                    }
+                }
+                Reply::Symbols(syms) => {
+                    if let Some(path) = self.pending_outline.remove(&id) {
+                        self.apply_outline(path, syms);
+                    }
                 }
             }
         }
+        // サーバーが準備できたら、開いているファイルのアウトラインを LSP から取り直す。
+        self.request_outline_if_ready();
         // 一定時間応答が無い要求は tags フォールバックへ（rust-analyzer 索引中対策）。
         let timed_out: Vec<i64> = self
             .pending_nav
@@ -1235,6 +1279,59 @@ impl App {
                     NavKind::Refs => self.references_via_tags(&p.word),
                 }
             }
+        }
+    }
+
+    /// `outline_want` のファイルについて、サーバー準備済みなら documentSymbol を送る。
+    /// 開いているファイルが変わっていたら要求を取り下げる。
+    fn request_outline_if_ready(&mut self) {
+        let Some(path) = self.outline_want.clone() else {
+            return;
+        };
+        let still_open = self.open.as_ref().is_some_and(|o| o.path == path);
+        if !still_open {
+            self.outline_want = None;
+            return;
+        }
+        if self.lsp.is_ready_for(&path)
+            && let Some(id) = self.lsp.request_document_symbol(&path)
+        {
+            self.pending_outline.insert(id, path);
+            self.outline_want = None;
+        }
+    }
+
+    /// documentSymbol の結果をアウトラインへ反映する（対象ファイルがまだ開いている場合）。
+    /// 空応答時は既存（tree-sitter）アウトラインを保持する。
+    fn apply_outline(&mut self, path: PathBuf, syms: Vec<SymInfo>) {
+        if syms.is_empty() {
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.path != path {
+            return;
+        }
+        open.outline = syms
+            .into_iter()
+            .map(|s| {
+                let col = open
+                    .raw_lines
+                    .get(s.line)
+                    .map(|l| lsp::utf16_to_char(l, s.character))
+                    .unwrap_or(0);
+                Symbol {
+                    name: s.name,
+                    kind: s.kind,
+                    line: s.line,
+                    col,
+                }
+            })
+            .collect();
+        open.outline_source = OutlineSource::Lsp;
+        if open.outline_selected >= open.outline.len() {
+            open.outline_selected = 0;
         }
     }
 
@@ -1787,9 +1884,23 @@ impl App {
             cursor_line: 0,
             cursor_col: 0,
             outline,
+            outline_source: OutlineSource::TreeSitter,
             outline_selected: 0,
             change_marks,
         });
+        // LSP 対応言語なら、サーバーを（必要なら）起動して didOpen し、準備でき次第
+        // documentSymbol でアウトラインを取り直す（tree-sitter 索引は即時の暫定表示）。
+        self.outline_want = None;
+        if let Some((p, lang, text)) = self.open.as_ref().and_then(|o| {
+            self.lsp
+                .lang_id_for(&o.path)
+                .map(|lang| (o.path.clone(), lang, o.raw_lines.join("\n")))
+        }) {
+            if self.lsp.ensure_open(&p, &lang, &text) {
+                self.flash = Some(format!("LSP for {lang} unavailable (using tags)"));
+            }
+            self.outline_want = Some(p);
+        }
         // 左ペイン（ツリー／変更ファイル一覧）の選択を開いたファイルに同期する。
         self.tree.reveal(path);
         self.sync_changed_to_open();
@@ -1940,6 +2051,7 @@ mod tests {
             cursor_line: 0,
             cursor_col: 0,
             outline: Vec::new(),
+            outline_source: OutlineSource::TreeSitter,
             outline_selected: 0,
             change_marks: Vec::new(),
         }

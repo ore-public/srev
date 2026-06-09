@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
 
-use lsp_types::{GotoDefinitionResponse, Url};
+use lsp_types::{DocumentSymbol, DocumentSymbolResponse, GotoDefinitionResponse, SymbolKind, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -238,6 +238,31 @@ pub struct LspManager {
     servers: HashMap<String, LspServer>,
     unavailable: HashSet<String>,
     next_id: i64,
+    /// 送信済み要求の応答の種別（Location 群か DocumentSymbol 群か）。
+    kinds: HashMap<i64, ReqKind>,
+}
+
+/// 送信した要求の応答パーサ種別。
+enum ReqKind {
+    Locations,
+    Symbols,
+}
+
+/// LSP 応答（要求 ID で App 側の用途に対応付ける）。
+pub enum Reply {
+    /// definition / references の結果。
+    Locations(Vec<Loc>),
+    /// documentSymbol の結果（アウトライン用、ドキュメント順にフラット化済み）。
+    Symbols(Vec<SymInfo>),
+}
+
+/// アウトライン 1 項目（`character` は UTF-16 列）。
+#[derive(Clone, Debug)]
+pub struct SymInfo {
+    pub name: String,
+    pub kind: String,
+    pub line: usize,
+    pub character: u32,
 }
 
 impl LspManager {
@@ -248,6 +273,7 @@ impl LspManager {
             servers: HashMap::new(),
             unavailable: HashSet::new(),
             next_id: 1,
+            kinds: HashMap::new(),
         }
     }
 
@@ -314,35 +340,32 @@ impl LspManager {
 
     /// `textDocument/definition` を送り、要求 ID を返す（サーバー未準備なら `None`）。
     pub fn request_definition(&mut self, path: &Path, line: u32, character: u32) -> Option<i64> {
-        self.request("textDocument/definition", path, line, character, None)
+        let params = self.position_params(path, line, character, None)?;
+        self.dispatch(path, "textDocument/definition", params, ReqKind::Locations)
     }
 
     /// `textDocument/references`（宣言を含めない）を送り、要求 ID を返す。
     pub fn request_references(&mut self, path: &Path, line: u32, character: u32) -> Option<i64> {
-        self.request(
-            "textDocument/references",
-            path,
-            line,
-            character,
-            Some(json!({ "includeDeclaration": false })),
-        )
+        let params =
+            self.position_params(path, line, character, Some(json!({ "includeDeclaration": false })))?;
+        self.dispatch(path, "textDocument/references", params, ReqKind::Locations)
     }
 
-    fn request(
-        &mut self,
-        method: &str,
+    /// `textDocument/documentSymbol` を送り、要求 ID を返す（アウトライン用）。
+    pub fn request_document_symbol(&mut self, path: &Path) -> Option<i64> {
+        let uri = uri_of(path)?;
+        let params = json!({ "textDocument": { "uri": uri } });
+        self.dispatch(path, "textDocument/documentSymbol", params, ReqKind::Symbols)
+    }
+
+    fn position_params(
+        &self,
         path: &Path,
         line: u32,
         character: u32,
         context: Option<Value>,
-    ) -> Option<i64> {
-        let lang = self.lang_id_for(path)?;
+    ) -> Option<Value> {
         let uri = uri_of(path)?;
-        let id = self.alloc_id();
-        let server = self.servers.get_mut(&lang)?;
-        if !server.initialized || server.dead {
-            return None;
-        }
         let mut params = json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character },
@@ -350,18 +373,32 @@ impl LspManager {
         if let Some(ctx) = context {
             params["context"] = ctx;
         }
-        server.send(request(id, method, params));
+        Some(params)
+    }
+
+    /// 準備済みサーバーへ要求を送り、応答パーサ種別を控えて ID を返す。
+    fn dispatch(&mut self, path: &Path, method: &str, params: Value, kind: ReqKind) -> Option<i64> {
+        let lang = self.lang_id_for(path)?;
+        let id = self.alloc_id();
+        {
+            let server = self.servers.get_mut(&lang)?;
+            if !server.initialized || server.dead {
+                return None;
+            }
+            server.send(request(id, method, params));
+        }
+        self.kinds.insert(id, kind);
         Some(id)
     }
 
-    /// 毎フレーム呼ぶ。到着した応答を `(要求ID, ジャンプ先一覧)` で返す。
-    /// 空の `Vec<Loc>` は「該当なし／エラー」を表し、呼び出し側で tags フォールバックする。
-    pub fn poll(&mut self) -> Vec<(i64, Vec<Loc>)> {
-        let mut out = Vec::new();
+    /// 毎フレーム呼ぶ。到着した応答を `(要求ID, 応答)` で返す。
+    /// `Locations` が空なら「該当なし／エラー」で、呼び出し側で tags フォールバックする。
+    pub fn poll(&mut self) -> Vec<(i64, Reply)> {
+        let mut raw: Vec<(i64, Value)> = Vec::new();
         for server in self.servers.values_mut() {
             loop {
                 match server.in_rx.try_recv() {
-                    Ok(msg) => handle_message(server, msg, &mut out),
+                    Ok(msg) => handle_message(server, msg, &mut raw),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         server.dead = true;
@@ -370,12 +407,21 @@ impl LspManager {
                 }
             }
         }
-        out
+        raw.into_iter()
+            .filter_map(|(id, result)| {
+                let reply = match self.kinds.remove(&id)? {
+                    ReqKind::Locations => Reply::Locations(parse_locations(&result)),
+                    ReqKind::Symbols => Reply::Symbols(parse_symbols(&result)),
+                };
+                Some((id, reply))
+            })
+            .collect()
     }
 }
 
-/// サーバーからの 1 メッセージを処理する。
-fn handle_message(server: &mut LspServer, msg: Value, out: &mut Vec<(i64, Vec<Loc>)>) {
+/// サーバーからの 1 メッセージを処理する。応答は生の `result` を `out` へ積み、
+/// パースは [`LspManager::poll`] が要求種別に応じて行う。
+fn handle_message(server: &mut LspServer, msg: Value, out: &mut Vec<(i64, Value)>) {
     let has_method = msg.get("method").is_some();
     let id = msg.get("id");
 
@@ -398,8 +444,7 @@ fn handle_message(server: &mut LspServer, msg: Value, out: &mut Vec<(i64, Vec<Lo
                 let _ = server.out_tx.send(m);
             }
         } else {
-            let locs = msg.get("result").map(parse_locations).unwrap_or_default();
-            out.push((id, locs));
+            out.push((id, msg.get("result").cloned().unwrap_or(Value::Null)));
         }
     }
     // それ以外（サーバー通知: progress / diagnostics 等）は無視。
@@ -438,6 +483,79 @@ fn parse_locations(result: &Value) -> Vec<Loc> {
     }
 }
 
+/// documentSymbol の結果（フラット／階層）をドキュメント順のフラットな一覧へ。
+/// 階層型は深さ優先で展開し、位置は名前の位置（selectionRange/location）を使う。
+fn parse_symbols(result: &Value) -> Vec<SymInfo> {
+    if result.is_null() {
+        return Vec::new();
+    }
+    let Ok(resp) = serde_json::from_value::<DocumentSymbolResponse>(result.clone()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match resp {
+        DocumentSymbolResponse::Flat(infos) => {
+            for si in infos {
+                let p = si.location.range.start;
+                out.push(SymInfo {
+                    name: si.name,
+                    kind: symbol_kind_str(si.kind).to_string(),
+                    line: p.line as usize,
+                    character: p.character,
+                });
+            }
+        }
+        DocumentSymbolResponse::Nested(syms) => {
+            for s in &syms {
+                flatten_symbol(s, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn flatten_symbol(s: &DocumentSymbol, out: &mut Vec<SymInfo>) {
+    let p = s.selection_range.start;
+    out.push(SymInfo {
+        name: s.name.clone(),
+        kind: symbol_kind_str(s.kind).to_string(),
+        line: p.line as usize,
+        character: p.character,
+    });
+    if let Some(children) = &s.children {
+        for c in children {
+            flatten_symbol(c, out);
+        }
+    }
+}
+
+/// LSP の `SymbolKind` を、アウトラインのグリフ解決（ui.rs `kind_glyph`）が
+/// 認識する文字列へ。`SymbolKind` は newtype のため等価比較で振り分ける。
+fn symbol_kind_str(k: SymbolKind) -> &'static str {
+    use lsp_types::SymbolKind as K;
+    if k == K::FUNCTION {
+        "function"
+    } else if k == K::METHOD {
+        "method"
+    } else if k == K::CONSTRUCTOR {
+        "constructor"
+    } else if k == K::CLASS {
+        "class"
+    } else if k == K::STRUCT {
+        "struct"
+    } else if k == K::INTERFACE {
+        "interface"
+    } else if k == K::ENUM {
+        "enum"
+    } else if k == K::MODULE || k == K::NAMESPACE || k == K::PACKAGE {
+        "module"
+    } else if k == K::CONSTANT || k == K::ENUM_MEMBER {
+        "constant"
+    } else {
+        "symbol"
+    }
+}
+
 // ───────────────────────── JSON-RPC メッセージ / フレーミング ─────────────────────────
 
 fn request(id: i64, method: &str, params: Value) -> Value {
@@ -457,6 +575,10 @@ fn initialize_params(root: &Path) -> Value {
             "textDocument": {
                 "definition": { "dynamicRegistration": false, "linkSupport": true },
                 "references": { "dynamicRegistration": false },
+                "documentSymbol": {
+                    "dynamicRegistration": false,
+                    "hierarchicalDocumentSymbolSupport": true,
+                },
             }
         },
     })
@@ -550,6 +672,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_symbols_flat_and_nested() {
+        // 階層型（DocumentSymbol）。子は親の直後にフラット化される。
+        let nested = json!([
+            {
+                "name": "target", "kind": 12,
+                "range": { "start": {"line":1,"character":0}, "end": {"line":1,"character":30} },
+                "selectionRange": { "start": {"line":1,"character":9}, "end": {"line":1,"character":15} },
+                "children": [
+                    {
+                        "name": "x", "kind": 13,
+                        "range": { "start": {"line":2,"character":0}, "end": {"line":2,"character":5} },
+                        "selectionRange": { "start": {"line":2,"character":2}, "end": {"line":2,"character":3} }
+                    }
+                ]
+            }
+        ]);
+        let syms = parse_symbols(&nested);
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "target");
+        assert_eq!(syms[0].kind, "function"); // SymbolKind 12
+        assert_eq!((syms[0].line, syms[0].character), (1, 9)); // selectionRange の位置
+        assert_eq!(syms[1].name, "x");
+        assert_eq!(syms[1].line, 2);
+
+        // フラット型（SymbolInformation）。
+        let flat = json!([
+            {
+                "name": "Foo", "kind": 5,
+                "location": {
+                    "uri": "file:///t.php",
+                    "range": { "start": {"line":3,"character":4}, "end": {"line":3,"character":7} }
+                }
+            }
+        ]);
+        let syms = parse_symbols(&flat);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].kind, "class"); // SymbolKind 5
+        assert_eq!((syms[0].line, syms[0].character), (3, 4));
+
+        assert!(parse_symbols(&Value::Null).is_empty());
+    }
+
+    #[test]
     fn config_defaults_cover_rust_php_ruby() {
         let cfg = LspConfig {
             langs: default_langs(),
@@ -608,8 +774,11 @@ mod tests {
                 }
                 last_req = Instant::now();
             }
-            for (rid, locs) in mgr.poll() {
-                if pending.contains(&rid) && !locs.is_empty() {
+            for (rid, reply) in mgr.poll() {
+                if let Reply::Locations(locs) = reply
+                    && pending.contains(&rid)
+                    && !locs.is_empty()
+                {
                     assert_eq!(locs[0].line, 0, "target() is defined on line 0");
                     assert!(locs[0].path.ends_with("main.rs"), "got {:?}", locs[0].path);
                     let _ = std::fs::remove_dir_all(&dir);
@@ -658,8 +827,11 @@ mod tests {
                 }
                 last_req = Instant::now();
             }
-            for (rid, locs) in mgr.poll() {
-                if pending.contains(&rid) && !locs.is_empty() {
+            for (rid, reply) in mgr.poll() {
+                if let Reply::Locations(locs) = reply
+                    && pending.contains(&rid)
+                    && !locs.is_empty()
+                {
                     assert_eq!(locs[0].line, 1, "target() defined on line 1");
                     let _ = std::fs::remove_dir_all(&dir);
                     return;
@@ -668,6 +840,56 @@ mod tests {
             if Instant::now() > deadline {
                 let _ = std::fs::remove_dir_all(&dir);
                 panic!("intelephense did not resolve definition within timeout");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// intelephense から documentSymbol（アウトライン）を取得できることを実機検証（手動）。
+    #[test]
+    #[ignore = "spawns intelephense; run with --ignored"]
+    fn intelephense_lists_symbols() {
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("srev_php_sym_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "<?php\nfunction target() { return 1; }\nclass Foo { public function bar() {} }\n";
+        let main_php = dir.join("main.php");
+        std::fs::write(&main_php, src).unwrap();
+
+        let mut mgr = LspManager::new(&dir);
+        if mgr.ensure_open(&main_php, "php", src) {
+            eprintln!("[php-sym] intelephense unavailable; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut pending = HashSet::new();
+        let mut last_req = Instant::now() - Duration::from_secs(10);
+        loop {
+            if last_req.elapsed() > Duration::from_secs(2) {
+                if let Some(id) = mgr.request_document_symbol(&main_php) {
+                    pending.insert(id);
+                }
+                last_req = Instant::now();
+            }
+            for (rid, reply) in mgr.poll() {
+                if let Reply::Symbols(syms) = reply
+                    && pending.contains(&rid)
+                    && !syms.is_empty()
+                {
+                    let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+                    assert!(names.contains(&"target"), "symbols: {names:?}");
+                    assert!(names.iter().any(|n| n.contains("Foo")), "symbols: {names:?}");
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+            }
+            if Instant::now() > deadline {
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("intelephense did not return document symbols within timeout");
             }
             thread::sleep(Duration::from_millis(50));
         }

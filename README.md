@@ -16,7 +16,7 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **LSP-powered `gd` / `gr`** — when a language server is available (rust-analyzer / intelephense / ruby-lsp by default, configurable), jumps use real semantic analysis. Falls back automatically to a built-in tree-sitter tag index when no server is configured or running
 - **Jump history** — every jump (`gd`, outline, project search, `gg`/`G`, in-file search) remembers where you came from; go back/forward with `(` / `)` (works across files). A **jump-history pane on the right** visualizes the trail with the current position highlighted (toggle with `J`)
 - **Visual mode** (`v`/`V`) to select a range, then `y` to copy to clipboard
-- **Outline pane** (bottom-left) lists symbols in the open file for quick navigation
+- **Outline pane** (bottom-left) lists symbols in the open file for quick navigation — from the **LSP `documentSymbol`** when a server is available (e.g. PHP via intelephense), otherwise from the tree-sitter index; the title shows which (`Symbols · LSP` / `Symbols · tree-sitter`)
 - **In-file search** (`/` → `Enter`, `n`/`N` for next/previous match)
 - **Fuzzy file search** (`Ctrl-P`, powered by nucleo — fzf equivalent)
 - **Project-wide content search** (`Ctrl-F`, case-insensitive substring) — jump to a matching line
@@ -316,7 +316,17 @@ and `.phtml` are highlighted as PHP (a dedicated Blade grammar is not bundled).
    while a server is still starting up. Name-based and approximate, supported for
    **Rust, Python, JavaScript, Go, Ruby, C**.
 
-The **Outline pane** always uses the tree-sitter index (same language set).
+The **Outline pane** (Symbols) works the same way: it shows tree-sitter symbols
+immediately on open, then **upgrades to the language server's `documentSymbol`**
+once it is ready (so PHP and other non-tree-sitter languages get an outline too).
+The pane title shows which source is active — `Symbols · tree-sitter` or
+`Symbols · LSP`.
+
+> Because the outline uses the server, opening a file of an LSP-configured
+> language now **starts that server in the background** (previously it started
+> on the first `gd` / `gr`). This also warms up `gd` / `gr`. Pure browsing of a
+> Rust file therefore launches rust-analyzer; if no server is configured the
+> outline stays on tree-sitter.
 
 ---
 
