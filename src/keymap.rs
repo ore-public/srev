@@ -62,6 +62,10 @@ pub enum Action {
     JumpForward,
     /// 右側のジャンプ履歴ペインの表示/非表示を切替。
     ToggleJumps,
+    /// コミットビュー（デフォルトブランチとの差分コミット一覧）の表示/非表示を切替。
+    ToggleCommits,
+    /// ブランチ切替ピッカーを開く（origin fetch → 一覧 → 選択で checkout）。
+    SwitchBranch,
 }
 
 impl Action {
@@ -102,6 +106,8 @@ impl Action {
             "jump_back" | "back" => Self::JumpBack,
             "jump_forward" | "forward" => Self::JumpForward,
             "toggle_jumps" | "jumps" => Self::ToggleJumps,
+            "toggle_commits" | "commits" => Self::ToggleCommits,
+            "switch_branch" | "branch" | "branches" => Self::SwitchBranch,
             _ => return None,
         })
     }
@@ -246,6 +252,8 @@ impl Keymap {
         add(ch(')'), JumpForward);
         add(ctrl('o'), JumpBack);
         add(ch('J'), ToggleJumps); // 右のジャンプ履歴ペイン表示切替
+        add(ch('c'), ToggleCommits); // コミットビュー（デフォルトブランチとの差分）
+        add(ctrl('v'), SwitchBranch); // ブランチ切替（origin fetch → 一覧 → checkout）
 
         Self { map }
     }

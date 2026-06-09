@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::app::{
-    App, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, RefList, SelRegion, ViewMode,
+    App, BranchList, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, RefList,
+    SelRegion, ViewMode,
 };
 use crate::diffview::LineMark;
 use crate::finder::Finder;
@@ -45,12 +46,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [tree_area, outline_area] =
         Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(left);
 
-    // 左ペインの表示データを先に組み立てる（あいまいランキングのため &mut）。
-    let left_pane = app.left_pane(tree_area.height.saturating_sub(3) as usize);
-    let outline_pane = app.outline_pane(outline_area.height.saturating_sub(3) as usize);
+    // コミットビューでは左上=コミット一覧、左下=変更ファイル一覧。
+    if app.view_mode == ViewMode::Commits {
+        let (ctitle, crows) = app.commit_list_rows(tree_area.height.saturating_sub(2) as usize);
+        render_list_pane(
+            frame,
+            tree_area,
+            &ctitle,
+            None,
+            &crows,
+            app.focus == Focus::Tree,
+        );
+        let (ftitle, frows) =
+            app.commit_file_rows(outline_area.height.saturating_sub(2) as usize);
+        render_list_pane(
+            frame,
+            outline_area,
+            &ftitle,
+            None,
+            &frows,
+            app.focus == Focus::Outline,
+        );
+    } else {
+        // 左ペインの表示データを先に組み立てる（あいまいランキングのため &mut）。
+        let left_pane = app.left_pane(tree_area.height.saturating_sub(3) as usize);
+        let outline_pane = app.outline_pane(outline_area.height.saturating_sub(3) as usize);
 
-    render_tree(frame, tree_area, app, &left_pane);
-    render_outline(frame, outline_area, &outline_pane, app.focus == Focus::Outline);
+        render_tree(frame, tree_area, app, &left_pane);
+        render_outline(frame, outline_area, &outline_pane, app.focus == Focus::Outline);
+    }
 
     // コード表示ではカーソルが見えるようスクロールを追従させる。
     // ジャンプ直後（recenter）はカーソルを画面中央に置く。
@@ -83,6 +107,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(refs) = &app.refs {
         render_refs(frame, frame.area(), refs);
+    }
+    if let Some(branches) = &app.branches {
+        render_branches(frame, frame.area(), branches);
     }
 
     // 端末カーソルをコード上の位置に表示。
@@ -296,6 +323,8 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
     let mode = match app.view_mode {
         ViewMode::Diff if app.effective_split() => "Diff (split)",
         ViewMode::Diff => "Diff",
+        ViewMode::Commits if app.effective_split() => "Commit (split)",
+        ViewMode::Commits => "Commit",
         ViewMode::Code => "Code",
     };
     let title = match &app.open {
@@ -318,10 +347,18 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     match app.view_mode {
-        ViewMode::Diff if open.has_diff() => render_diff(frame, inner, open, app.effective_split()),
+        ViewMode::Diff | ViewMode::Commits if open.has_diff() => {
+            render_diff(frame, inner, open, app.effective_split())
+        }
         ViewMode::Diff => {
             frame.render_widget(
                 Paragraph::new(Line::from("(no diff for this file — d for code)").dim()),
+                inner,
+            );
+        }
+        ViewMode::Commits => {
+            frame.render_widget(
+                Paragraph::new(Line::from("(no textual diff for this file)").dim()),
                 inner,
             );
         }
@@ -572,7 +609,18 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         "filter"
     };
     // モード別・優先度順のヒント。端末幅に入るぶんだけ前から詰める（見切れ防止）。
-    let items: Vec<(&str, &str)> = if app.view_mode == ViewMode::Diff {
+    let items: Vec<(&str, &str)> = if app.view_mode == ViewMode::Commits {
+        vec![
+            ("q", "quit"),
+            ("Tab", "pane"),
+            ("j/k", "commit/file"),
+            ("] [", "Next/Prev File"),
+            ("n/N", "hunk"),
+            ("s", "split"),
+            ("c", "exit commits"),
+            ("^R", "reload"),
+        ]
+    } else if app.view_mode == ViewMode::Diff {
         vec![
             ("q", "quit"),
             ("Tab", "pane"),
@@ -580,6 +628,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("n/N", "hunk"),
             ("s", "split"),
             ("d", "code"),
+            ("c", "commits"),
             ("^P", "Find File"),
             ("^F", "Search Text"),
             ("/", find_word),
@@ -598,6 +647,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("( )", "jump back/fwd"),
             ("J", "jumps pane"),
             ("d", "diff"),
+            ("c", "commits"),
+            ("^V", "branch"),
             ("v/V/y", "yank"),
             ("Y", "loc"),
             ("^R", "reload"),
@@ -752,6 +803,51 @@ fn render_refs(frame: &mut Frame, area: Rect, refs: &RefList) {
             ];
             spans.extend(highlight_match(&hit.preview, &needle));
             Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), inner);
+}
+
+fn render_branches(frame: &mut Frame, area: Rect, branches: &BranchList) {
+    let popup = centered_rect(area, 60, 70);
+    frame.render_widget(Clear, popup);
+
+    let title = format!(" Switch branch — {} (Enter: checkout) ", branches.entries.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let h = inner.height as usize;
+    let max_start = branches.entries.len().saturating_sub(h);
+    let start = branches.selected.saturating_sub(h / 2).min(max_start);
+
+    let rows: Vec<Line> = branches
+        .entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(h)
+        .map(|(i, e)| {
+            let selected = i == branches.selected;
+            // 先頭マーカー: 現在ブランチ `*`、それ以外は空白。
+            let marker = if e.is_head { "* " } else { "  " };
+            let name_style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Magenta)
+            } else if e.is_head {
+                Style::default().fg(Color::Green)
+            } else if e.is_remote {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(Color::Green)),
+                Span::styled(e.display.clone(), name_style),
+            ])
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), inner);

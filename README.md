@@ -24,6 +24,8 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **`Ctrl-R` reload** — re-reads the open file, git state, tree, and index while keeping cursor position
 - **Syntax highlighting** for 200+ languages via syntect (incl. PHP, HAML, TOML, TypeScript…) — **Markdown also highlights code inside fenced blocks** per language
 - **Diff review navigation** — jump between hunks with `n`/`N`, between changed files with `]`/`[`. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
+- **Commit view** (`c`) — the left pane lists commits that differ from the default branch (`default..HEAD`), or the full log when you're on the default branch. Pick a commit to see its changed files (bottom-left) and the selected file's side-by-side diff
+- **Branch switching** (`Ctrl-V`) — fetches `origin` first, then shows local and remote branches; selecting one checks it out (via `git`, auto-creating a tracking branch for remotes) and reloads automatically
 - File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked). Dotfiles and `.gitignore`d files are listed too, shown **dimmed**; ignored directories (e.g. `target/`) appear but aren't descended into, and the `.git` directory is excluded
 - **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD
 - Single binary. Builds on Linux / macOS / Windows
@@ -103,6 +105,8 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `q` | Quit |
 | `Tab` | Cycle focus (tree → outline → content) |
 | `d` | Toggle diff ⇄ code (line position preserved) |
+| `c` | Toggle the commit view (commits vs the default branch, or full log) |
+| `Ctrl-V` | Switch branch (fetches `origin` first, then pick a branch to check out) |
 | `Ctrl-P` | Open fuzzy file search overlay |
 | `Ctrl-F` | Project-wide content search (substring); `Enter` jumps to the matching line |
 | `Ctrl-R` | Reload (file, git state, tree, index — cursor kept) |
@@ -235,6 +239,8 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `jump_back` | Jump history: go back |
 | `jump_forward` | Jump history: go forward |
 | `toggle_jumps` | Toggle the jump-history pane |
+| `toggle_commits` | Toggle the commit view |
+| `switch_branch` | Open the branch picker (fetch + checkout) |
 
 Use `"none"` to disable a key binding.
 The `g` prefix for `gg` / `gd` cannot be remapped.

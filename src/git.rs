@@ -1,9 +1,10 @@
 //! git2 を用いた作業ツリー vs HEAD の状態取得と差分。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use git2::{Diff, DiffFormat, DiffOptions, Repository, Status};
+use git2::{BranchType, Delta, Diff, DiffFormat, DiffOptions, Oid, Repository, Sort, Status};
 
 /// ファイルの変更種別（ツリー表示と差分の見出しに使う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,50 @@ pub struct DiffLine {
     pub new_lineno: Option<u32>,
     pub content: String,
 }
+
+/// コミット一覧の 1 件（コミットビュー左上ペイン用）。
+#[derive(Clone)]
+pub struct CommitInfo {
+    pub id: Oid,
+    /// 短縮ハッシュ（7 桁）。
+    pub short: String,
+    /// 1 行目のサマリ。
+    pub summary: String,
+    /// `YYYY-MM-DD`（コミット日時, UTC）。
+    pub date: String,
+}
+
+/// あるコミットで変更された 1 ファイル。
+#[derive(Clone)]
+pub struct CommitFile {
+    pub rel: String,
+    pub status: FileStatus,
+}
+
+/// ブランチ切替ピッカーの 1 件。
+#[derive(Clone)]
+pub struct BranchEntry {
+    /// 表示名（ローカルは `feature`、リモートは `origin/feature`）。
+    pub display: String,
+    /// checkout に渡す名前（リモートは短縮名にして tracking を自動作成させる）。
+    pub target: String,
+    /// 現在チェックアウト中のブランチか。
+    pub is_head: bool,
+    /// リモート追跡ブランチか（表示色を変える）。
+    pub is_remote: bool,
+}
+
+/// コミット一覧の取得結果。
+pub struct CommitLog {
+    pub commits: Vec<CommitInfo>,
+    /// 現在 HEAD がデフォルトブランチか（true なら全履歴を出している）。
+    pub on_default: bool,
+    /// 基準となるデフォルトブランチ名（表示用）。
+    pub default_branch: String,
+}
+
+/// 全履歴表示時のコミット数上限（巨大リポジトリでの一括構築を避ける）。
+const MAX_COMMITS: usize = 2000;
 
 pub struct GitInfo {
     repo: Repository,
@@ -118,6 +163,250 @@ impl GitInfo {
 
         Some(collect_diff_lines(&diff))
     }
+
+    /// 現在のブランチ名（detached HEAD 等で取れなければ `None`）。
+    pub fn current_branch(&self) -> Option<String> {
+        let head = self.repo.head().ok()?;
+        if head.is_branch() {
+            head.shorthand().ok().map(|s| s.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// リポジトリのデフォルトブランチ名を推定する。
+    /// `origin/HEAD` の指す先 → ローカル `main`/`master` の順。
+    pub fn default_branch(&self) -> String {
+        if let Ok(r) = self.repo.find_reference("refs/remotes/origin/HEAD")
+            && let Ok(Some(target)) = r.symbolic_target()
+            && let Some(name) = target.strip_prefix("refs/remotes/origin/")
+        {
+            return name.to_string();
+        }
+        for cand in ["main", "master"] {
+            if self
+                .repo
+                .find_branch(cand, git2::BranchType::Local)
+                .is_ok()
+            {
+                return cand.to_string();
+            }
+        }
+        "main".to_string()
+    }
+
+    /// デフォルトブランチの先端コミット Oid を解決する（ローカル → origin の順）。
+    fn default_branch_oid(&self, name: &str) -> Option<Oid> {
+        for spec in [name.to_string(), format!("origin/{name}")] {
+            if let Ok(obj) = self.repo.revparse_single(&spec)
+                && let Ok(commit) = obj.peel_to_commit()
+            {
+                return Some(commit.id());
+            }
+        }
+        None
+    }
+
+    /// コミット一覧を返す。現在ブランチがデフォルトでなければ `default..HEAD`
+    /// （デフォルトに無い＝このブランチ固有のコミット）、デフォルトなら全履歴。
+    pub fn commit_log(&self) -> CommitLog {
+        let default_branch = self.default_branch();
+        let mut out = CommitLog {
+            commits: Vec::new(),
+            on_default: true,
+            default_branch: default_branch.clone(),
+        };
+        let Ok(head) = self.repo.head().and_then(|h| h.peel_to_commit()) else {
+            return out;
+        };
+        let default_oid = self.default_branch_oid(&default_branch);
+        let on_default = self.current_branch().as_deref() == Some(default_branch.as_str())
+            || default_oid == Some(head.id());
+        out.on_default = on_default;
+
+        let Ok(mut walk) = self.repo.revwalk() else {
+            return out;
+        };
+        let _ = walk.set_sorting(Sort::TIME);
+        if walk.push(head.id()).is_err() {
+            return out;
+        }
+        // デフォルトに含まれるコミットを隠す（このブランチ固有のものだけ残す）。
+        if !on_default && let Some(base) = default_oid {
+            let _ = walk.hide(base);
+        }
+
+        for oid in walk.flatten().take(MAX_COMMITS) {
+            let Ok(commit) = self.repo.find_commit(oid) else {
+                continue;
+            };
+            out.commits.push(CommitInfo {
+                id: oid,
+                short: oid.to_string().chars().take(7).collect(),
+                summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
+                date: fmt_date(commit.time().seconds()),
+            });
+        }
+        out
+    }
+
+    /// 指定コミットで変更されたファイル一覧（親との差分）。
+    pub fn commit_files(&self, id: Oid) -> Vec<CommitFile> {
+        let Ok(commit) = self.repo.find_commit(id) else {
+            return Vec::new();
+        };
+        let tree = commit.tree().ok();
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let Ok(diff) =
+            self.repo
+                .diff_tree_to_tree(parent_tree.as_ref(), tree.as_ref(), None)
+        else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        for delta in diff.deltas() {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path());
+            let Some(path) = path else { continue };
+            files.push(CommitFile {
+                rel: path.to_string_lossy().to_string(),
+                status: status_of_delta(delta.status()),
+            });
+        }
+        files
+    }
+
+    /// 指定コミットの 1 ファイル分の差分（親 vs コミット）。
+    pub fn commit_file_diff(&self, id: Oid, rel: &str) -> Vec<DiffLine> {
+        let Ok(commit) = self.repo.find_commit(id) else {
+            return Vec::new();
+        };
+        let tree = commit.tree().ok();
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let mut opts = DiffOptions::new();
+        opts.pathspec(rel);
+        let Ok(diff) = self.repo.diff_tree_to_tree(
+            parent_tree.as_ref(),
+            tree.as_ref(),
+            Some(&mut opts),
+        ) else {
+            return Vec::new();
+        };
+        collect_diff_lines(&diff)
+    }
+
+    /// 指定コミット時点でのファイル内容（差分の「新」側ハイライト用）。
+    /// そのコミットで削除された等で存在しなければ空文字列。
+    pub fn commit_file_new_content(&self, id: Oid, rel: &str) -> String {
+        let blob = self
+            .repo
+            .find_commit(id)
+            .ok()
+            .and_then(|c| c.tree().ok())
+            .and_then(|t| t.get_path(Path::new(rel)).ok())
+            .and_then(|e| e.to_object(&self.repo).ok())
+            .and_then(|o| o.peel_to_blob().ok());
+        match blob {
+            Some(b) => String::from_utf8_lossy(b.content()).into_owned(),
+            None => String::new(),
+        }
+    }
+
+    /// `origin` から fetch する（ブランチ一覧を出す前に最新化）。成功なら `true`。
+    /// 認証・SSH を確実に扱うため git CLI に委譲する（ネットワーク待ちでブロックする）。
+    pub fn fetch_origin(&self) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.workdir)
+            .args(["fetch", "origin", "--quiet"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// ローカル＋リモート（origin）のブランチ一覧。現在ブランチを先頭、ローカル → リモートの順。
+    /// ローカルに同名がある origin ブランチと `origin/HEAD` は除外する。
+    pub fn branches(&self) -> Vec<BranchEntry> {
+        let mut out = Vec::new();
+        if let Ok(iter) = self.repo.branches(Some(BranchType::Local)) {
+            for (branch, _) in iter.flatten() {
+                if let Ok(Some(name)) = branch.name() {
+                    out.push(BranchEntry {
+                        display: name.to_string(),
+                        target: name.to_string(),
+                        is_head: branch.is_head(),
+                        is_remote: false,
+                    });
+                }
+            }
+        }
+        let local: HashSet<String> = out.iter().map(|e| e.target.clone()).collect();
+        if let Ok(iter) = self.repo.branches(Some(BranchType::Remote)) {
+            for (branch, _) in iter.flatten() {
+                if let Ok(Some(name)) = branch.name() {
+                    if name.ends_with("/HEAD") {
+                        continue;
+                    }
+                    let short = name.strip_prefix("origin/").unwrap_or(name);
+                    if local.contains(short) {
+                        continue;
+                    }
+                    out.push(BranchEntry {
+                        display: name.to_string(),
+                        target: short.to_string(),
+                        is_head: false,
+                        is_remote: true,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            (!a.is_head, a.is_remote, &a.display).cmp(&(!b.is_head, b.is_remote, &b.display))
+        });
+        out
+    }
+
+    /// 指定ブランチを checkout する（git CLI に委譲）。失敗時は stderr を返す。
+    pub fn checkout(&self, target: &str) -> Result<(), String> {
+        match Command::new("git")
+            .arg("-C")
+            .arg(&self.workdir)
+            .args(["checkout", target])
+            .output()
+        {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// git2 の差分 Delta 種別を [`FileStatus`] へ。
+fn status_of_delta(d: Delta) -> FileStatus {
+    match d {
+        Delta::Added | Delta::Copied => FileStatus::Added,
+        Delta::Deleted => FileStatus::Deleted,
+        Delta::Renamed => FileStatus::Renamed,
+        _ => FileStatus::Modified,
+    }
+}
+
+/// epoch 秒（UTC）を `YYYY-MM-DD` に。chrono 非依存（Howard Hinnant の civil_from_days）。
+fn fmt_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[cfg(test)]
@@ -173,6 +462,76 @@ mod tests {
         assert!(added.contains(&"TWO"), "added={added:?}");
         assert!(added.contains(&"three"), "added={added:?}");
         assert!(deleted.contains(&"two"), "deleted={deleted:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_log_lists_branch_commits_and_file_diff() {
+        let dir = std::env::temp_dir().join(format!("srev_clog_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "tester"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        // フィーチャーブランチ固有のコミットを 2 つ作る。
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&dir, &["commit", "-qam", "add two"]);
+        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "add b"]);
+
+        let info = GitInfo::discover(&dir).expect("repo");
+        let log = info.commit_log();
+        assert!(!log.on_default, "feature branch is not default");
+        assert_eq!(log.default_branch, "main");
+        let summaries: Vec<&str> = log.commits.iter().map(|c| c.summary.as_str()).collect();
+        assert!(summaries.contains(&"add two"), "{summaries:?}");
+        assert!(summaries.contains(&"add b"), "{summaries:?}");
+        assert!(!summaries.contains(&"init"), "init is on main, should be hidden");
+
+        // 「add b」コミットは b.txt を追加している。
+        let addb = log.commits.iter().find(|c| c.summary == "add b").unwrap();
+        let files = info.commit_files(addb.id);
+        assert!(files.iter().any(|f| f.rel == "b.txt" && f.status == FileStatus::Added));
+        let diff = info.commit_file_diff(addb.id, "b.txt");
+        assert!(diff.iter().any(|l| l.kind == DiffKind::Add && l.content == "new"));
+        assert_eq!(info.commit_file_new_content(addb.id, "b.txt"), "new\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branches_lists_locals_and_checkout_switches() {
+        let dir = std::env::temp_dir().join(format!("srev_branch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "tester"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+
+        let info = GitInfo::discover(&dir).expect("repo");
+        let branches = info.branches();
+        let names: Vec<&str> = branches.iter().map(|b| b.display.as_str()).collect();
+        assert!(names.contains(&"main"), "{names:?}");
+        assert!(names.contains(&"feature"), "{names:?}");
+        // 現在ブランチ feature が先頭かつ is_head。
+        assert!(branches[0].is_head);
+        assert_eq!(branches[0].display, "feature");
+
+        // checkout で実際に切り替わる。
+        info.checkout("main").expect("checkout main");
+        assert_eq!(info.current_branch().as_deref(), Some("main"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -10,7 +10,7 @@ use ratatui::text::Line;
 use crate::diffview::{self, DiffRender};
 use crate::finder::{Finder, collect_files};
 use crate::fuzzy::Fuzzy;
-use crate::git::{FileStatus, GitInfo};
+use crate::git::{BranchEntry, CommitFile, CommitInfo, FileStatus, GitInfo};
 use crate::grep::ProjectSearch;
 use crate::highlight::CodeHighlighter;
 use crate::keymap::{Action, Chord, Keymap};
@@ -31,6 +31,8 @@ pub enum Focus {
 pub enum ViewMode {
     Diff,
     Code,
+    /// コミットビュー：左上=コミット一覧、左下=変更ファイル、右=ファイル差分。
+    Commits,
 }
 
 /// visual mode の選択。アンカーを固定し、もう一端はカーソル。
@@ -120,6 +122,23 @@ impl RefList {
     }
 }
 
+/// ブランチ切替ピッカーのオーバーレイ状態（`B`）。
+pub struct BranchList {
+    pub entries: Vec<BranchEntry>,
+    pub selected: usize,
+}
+
+impl BranchList {
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.entries.len() {
+            self.selected += 1;
+        }
+    }
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+}
+
 /// `[`/`]` で順送りする対象リスト。
 #[derive(Clone, Copy)]
 enum NavList {
@@ -127,6 +146,8 @@ enum NavList {
     Changed,
     /// 全ファイル（コードモード）。
     AllFiles,
+    /// 選択中コミットの変更ファイル（コミットビュー）。
+    CommitFiles,
 }
 
 /// 左上ペインの描画指示（ui へ渡す）。
@@ -295,6 +316,8 @@ pub struct App {
     pub show_jumps: bool,
     /// 参照（呼び出し元）一覧オーバーレイ（`gr`）。None なら非表示。
     pub refs: Option<RefList>,
+    /// ブランチ切替ピッカー（`B`）。None なら非表示。
+    pub branches: Option<BranchList>,
     /// ステータス行に一時表示するメッセージ（yank 結果など）。
     pub flash: Option<String>,
     /// flash を表示し始めた時刻（一定時間で自動的に消す）。
@@ -317,6 +340,18 @@ pub struct App {
     pending_outline: HashMap<i64, PathBuf>,
     /// LSP アウトラインを取得したいファイル（サーバー準備でき次第 documentSymbol を送る）。
     outline_want: Option<PathBuf>,
+    /// コミットビュー：デフォルトブランチとの差分コミット一覧（または全履歴）。
+    commits: Vec<CommitInfo>,
+    commit_selected: usize,
+    /// 選択中コミットの変更ファイル一覧（左下ペイン）。
+    commit_files: Vec<CommitFile>,
+    commit_file_selected: usize,
+    /// コミット一覧を構築済みか（初回 `c` で遅延構築）。
+    commits_loaded: bool,
+    /// 現在 HEAD がデフォルトブランチか（タイトル表示用）。
+    on_default_branch: bool,
+    /// 基準デフォルトブランチ名（タイトル表示用）。
+    default_branch_label: String,
     git: Option<GitInfo>,
     highlighter: CodeHighlighter,
     keymap: Keymap,
@@ -362,6 +397,7 @@ impl App {
             jump_forward: Vec::new(),
             show_jumps: true,
             refs: None,
+            branches: None,
             flash: None,
             flash_at: None,
             all_files,
@@ -376,6 +412,13 @@ impl App {
             pending_nav: HashMap::new(),
             pending_outline: HashMap::new(),
             outline_want: None,
+            commits: Vec::new(),
+            commit_selected: 0,
+            commit_files: Vec::new(),
+            commit_file_selected: 0,
+            commits_loaded: false,
+            on_default_branch: false,
+            default_branch_label: String::new(),
             git,
             highlighter: CodeHighlighter::new(),
             keymap: Keymap::load(),
@@ -447,6 +490,10 @@ impl App {
             self.on_key_refs(key);
             return;
         }
+        if self.branches.is_some() {
+            self.on_key_branches(key);
+            return;
+        }
         if self.tree_filter.is_some() {
             self.on_key_tree_filter(key);
             return;
@@ -503,6 +550,8 @@ impl App {
             JumpBack => self.go_back(),
             JumpForward => self.go_forward(),
             ToggleJumps => self.show_jumps = !self.show_jumps,
+            ToggleCommits => self.toggle_commit_view(),
+            SwitchBranch => self.open_branch_list(),
             Reload => self.reload(),
             // 差分モードでは変更ファイル一覧、コードモードでは全ファイルを順送り。
             NextFile => self.navigate_files(self.nav_list(), true),
@@ -529,6 +578,19 @@ impl App {
 
     fn tree_action(&mut self, action: Action) {
         use Action::*;
+        // コミットビューでは左上=コミット一覧を操作する。
+        if self.view_mode == ViewMode::Commits {
+            match action {
+                Down if self.commit_selected + 1 < self.commits.len() => {
+                    self.select_commit(self.commit_selected + 1)
+                }
+                Up if self.commit_selected > 0 => self.select_commit(self.commit_selected - 1),
+                // Enter/→ で左下のファイル一覧へフォーカス移動。
+                Activate | Right if !self.commit_files.is_empty() => self.focus = Focus::Outline,
+                _ => {}
+            }
+            return;
+        }
         // diff モードでは「変更ファイル一覧」を操作する。
         if self.view_mode == ViewMode::Diff {
             match action {
@@ -567,6 +629,21 @@ impl App {
 
     fn outline_action(&mut self, action: Action) {
         use Action::*;
+        // コミットビューでは左下=変更ファイル一覧を操作する。
+        if self.view_mode == ViewMode::Commits {
+            match action {
+                Down if self.commit_file_selected + 1 < self.commit_files.len() => {
+                    self.open_commit_file(self.commit_file_selected + 1)
+                }
+                Up if self.commit_file_selected > 0 => {
+                    self.open_commit_file(self.commit_file_selected - 1)
+                }
+                Activate | Right => self.focus = Focus::Content,
+                Left => self.focus = Focus::Tree,
+                _ => {}
+            }
+            return;
+        }
         match action {
             Down => {
                 if let Some(open) = self.open.as_mut()
@@ -599,7 +676,7 @@ impl App {
     fn content_action(&mut self, action: Action) {
         use Action::*;
         // 差分表示中はスクロール操作（カーソルはコード表示の概念）。
-        if self.view_mode == ViewMode::Diff {
+        if self.diff_content() {
             // n/N は次/前の hunk へ（self を可変借用するので先に処理）。
             match action {
                 SearchNext => {
@@ -1508,6 +1585,76 @@ impl App {
         }
     }
 
+    /// ブランチ切替ピッカーを開く。先に `origin` を fetch して一覧を最新化する。
+    fn open_branch_list(&mut self) {
+        let Some(git) = self.git.as_ref() else {
+            self.flash = Some("not a git repository".into());
+            return;
+        };
+        // fetch はネットワーク待ちでブロックする（手動操作なので許容）。失敗しても続行。
+        let fetched = git.fetch_origin();
+        let entries = git.branches();
+        if entries.is_empty() {
+            self.flash = Some("no branches".into());
+            return;
+        }
+        let selected = entries.iter().position(|e| e.is_head).unwrap_or(0);
+        self.branches = Some(BranchList { entries, selected });
+        if !fetched {
+            self.flash = Some("origin fetch failed (showing local)".into());
+        }
+    }
+
+    fn on_key_branches(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.branches = None,
+            KeyCode::Enter => {
+                let target = self
+                    .branches
+                    .as_ref()
+                    .and_then(|b| b.entries.get(b.selected))
+                    .map(|e| (e.target.clone(), e.is_head));
+                self.branches = None;
+                if let Some((target, is_head)) = target {
+                    if is_head {
+                        self.flash = Some(format!("already on {target}"));
+                        return;
+                    }
+                    match self.git.as_ref().map(|g| g.checkout(&target)) {
+                        Some(Ok(())) => {
+                            self.reload(); // checkout 後は自動でリロード
+                            self.flash = Some(format!("switched to {target}"));
+                        }
+                        Some(Err(e)) => self.flash = Some(format!("checkout failed: {e}")),
+                        None => {}
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(b) = self.branches.as_mut() {
+                    b.move_down()
+                }
+            }
+            KeyCode::Up => {
+                if let Some(b) = self.branches.as_mut() {
+                    b.move_up()
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if let Some(b) = self.branches.as_mut() {
+                    b.move_down()
+                }
+            }
+            KeyCode::Char('p') if ctrl => {
+                if let Some(b) = self.branches.as_mut() {
+                    b.move_up()
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 検索クエリに対し、現在行を含めず次/前のマッチへ。
     fn search_jump(&mut self, forward: bool) {
         self.do_search(forward, false);
@@ -1678,7 +1825,7 @@ impl App {
 
     /// 差分表示で次/前の hunk 見出し行へジャンプする。端では flash で知らせる。
     fn hunk(&mut self, forward: bool) {
-        if self.view_mode != ViewMode::Diff {
+        if !self.diff_content() {
             return;
         }
         self.ensure_diff_split();
@@ -1704,19 +1851,41 @@ impl App {
 
     /// 現在のモードに応じた順送り対象。
     fn nav_list(&self) -> NavList {
-        if self.view_mode == ViewMode::Diff {
-            NavList::Changed
-        } else {
-            NavList::AllFiles
+        match self.view_mode {
+            ViewMode::Commits => NavList::CommitFiles,
+            ViewMode::Diff => NavList::Changed,
+            ViewMode::Code => NavList::AllFiles,
         }
     }
 
     /// 変更ファイル一覧（差分）/ 全ファイル（コード）を順送りに開く共通処理。
     /// 端では flash で知らせる。
     fn navigate_files(&mut self, list: NavList, forward: bool) {
+        // コミットビューは選択中コミットの変更ファイルを順送りする。
+        if let NavList::CommitFiles = list {
+            let len = self.commit_files.len();
+            if len == 0 {
+                return;
+            }
+            let last = len - 1;
+            let cur = self.commit_file_selected.min(last);
+            let next = if forward {
+                (cur + 1).min(last)
+            } else {
+                cur.saturating_sub(1)
+            };
+            if next == cur {
+                self.flash = Some(if forward { "last file" } else { "first file" }.into());
+            } else {
+                self.open_commit_file(next);
+                self.focus = Focus::Content;
+            }
+            return;
+        }
         let len = match list {
             NavList::Changed => self.changed.len(),
             NavList::AllFiles => self.all_files.len(),
+            NavList::CommitFiles => 0,
         };
         if len == 0 {
             return;
@@ -1729,6 +1898,7 @@ impl App {
                 .open
                 .as_ref()
                 .and_then(|o| self.all_files.iter().position(|e| e.abs == o.path)),
+            NavList::CommitFiles => unreachable!(), // 上で早期 return 済み
         };
         let next = match cur {
             Some(i) if forward => (i + 1).min(last),
@@ -1740,6 +1910,7 @@ impl App {
             let (fwd, bwd) = match list {
                 NavList::Changed => ("last changed file", "first changed file"),
                 NavList::AllFiles => ("last file", "first file"),
+                NavList::CommitFiles => unreachable!(),
             };
             self.flash = Some(if forward { fwd } else { bwd }.into());
             return;
@@ -1750,6 +1921,7 @@ impl App {
                 self.changed[next].abs.clone()
             }
             NavList::AllFiles => self.all_files[next].abs.clone(),
+            NavList::CommitFiles => unreachable!(),
         };
         self.open_file(&path);
         self.focus = Focus::Content;
@@ -1774,6 +1946,19 @@ impl App {
         self.index = ProjectIndex::new(&self.root);
         self.index.start(); // 索引もバックグラウンドで作り直す
 
+        // コミット一覧も作り直す（次回 `c` で再構築。表示中なら即時）。
+        self.commits_loaded = false;
+        if self.view_mode == ViewMode::Commits {
+            self.load_commits();
+            if self.commits.is_empty() {
+                self.open = None;
+            } else {
+                self.select_commit(self.commit_selected.min(self.commits.len() - 1));
+            }
+            self.flash = Some("reloaded".into());
+            return;
+        }
+
         // 開いているファイルはカーソル・スクロールを保ったまま読み直す。
         if let Some(open) = self.open.as_ref() {
             let path = open.path.clone();
@@ -1794,10 +1979,21 @@ impl App {
         self.flash = Some("reloaded".into());
     }
 
+    /// コンテンツに差分（unified/split）を表示するモードか（Diff・Commits）。
+    fn diff_content(&self) -> bool {
+        matches!(self.view_mode, ViewMode::Diff | ViewMode::Commits)
+    }
+
     /// 差分 ⇄ コードをトグルする。現在の表示行を保持して相互に対応させる。
     fn toggle_view_mode(&mut self) {
+        // コミットビュー中の `d` はコミットビューを抜ける。
+        if self.view_mode == ViewMode::Commits {
+            self.exit_commit_view();
+            return;
+        }
         self.selection = None;
         let next = match self.view_mode {
+            ViewMode::Commits => ViewMode::Code, // 到達しない（上で処理）
             ViewMode::Diff => ViewMode::Code,
             ViewMode::Code => ViewMode::Diff,
         };
@@ -1834,7 +2030,168 @@ impl App {
                 }
             }
             ViewMode::Diff => self.sync_changed_to_open(),
+            ViewMode::Commits => {} // toggle_view_mode は Commits へは遷移しない
         }
+    }
+
+    // --- コミットビュー ---
+
+    /// コミットビューの表示/非表示を切り替える（`c`）。
+    fn toggle_commit_view(&mut self) {
+        if self.view_mode == ViewMode::Commits {
+            self.exit_commit_view();
+            return;
+        }
+        if self.git.is_none() {
+            self.flash = Some("not a git repository".into());
+            return;
+        }
+        if !self.commits_loaded {
+            self.load_commits();
+        }
+        self.view_mode = ViewMode::Commits;
+        self.focus = Focus::Tree;
+        self.selection = None;
+        if self.commits.is_empty() {
+            self.flash = Some("no commits to show".into());
+            self.open = None;
+        } else {
+            let idx = self.commit_selected.min(self.commits.len() - 1);
+            self.select_commit(idx);
+        }
+    }
+
+    /// コミットビューを抜けてコードモードへ戻る。
+    fn exit_commit_view(&mut self) {
+        self.view_mode = ViewMode::Code;
+        self.focus = Focus::Tree;
+        self.open = None; // 表示していたのは履歴ファイル。ツリーから選び直す。
+    }
+
+    /// コミット一覧を git から構築してキャッシュする。
+    fn load_commits(&mut self) {
+        if let Some(log) = self.git.as_ref().map(|g| g.commit_log()) {
+            self.commits = log.commits;
+            self.on_default_branch = log.on_default;
+            self.default_branch_label = log.default_branch;
+        }
+        self.commits_loaded = true;
+        self.commit_selected = 0;
+    }
+
+    /// コミットを選択し、その変更ファイル一覧を読んで先頭ファイルの差分を開く。
+    fn select_commit(&mut self, idx: usize) {
+        self.commit_selected = idx;
+        let id = match self.commits.get(idx) {
+            Some(c) => c.id,
+            None => {
+                self.commit_files.clear();
+                self.open = None;
+                return;
+            }
+        };
+        self.commit_files = self.git.as_ref().map(|g| g.commit_files(id)).unwrap_or_default();
+        self.commit_file_selected = 0;
+        if self.commit_files.is_empty() {
+            self.open = None;
+        } else {
+            self.open_commit_file(0);
+        }
+    }
+
+    /// 選択中コミットの指定ファイルの差分を Content に開く（LSP は使わない）。
+    fn open_commit_file(&mut self, file_idx: usize) {
+        let id = match self.commits.get(self.commit_selected) {
+            Some(c) => c.id,
+            None => return,
+        };
+        let rel = match self.commit_files.get(file_idx) {
+            Some(f) => f.rel.clone(),
+            None => {
+                self.open = None;
+                return;
+            }
+        };
+        self.commit_file_selected = file_idx;
+
+        // git からファイル内容と差分を取得（借用を閉じてからハイライトする）。
+        let (content, diff_lines) = {
+            let Some(git) = self.git.as_ref() else {
+                return;
+            };
+            (
+                git.commit_file_new_content(id, &rel).replace("\r\n", "\n"),
+                git.commit_file_diff(id, &rel),
+            )
+        };
+        let syntax = self.highlighter.detect(Path::new(&rel));
+        let lines = self.highlighter.highlight(syntax, &content);
+        let raw_lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let diff = (!diff_lines.is_empty())
+            .then(|| diffview::build(&diff_lines, &lines, &mut self.highlighter, syntax));
+        let change_marks = diff
+            .as_ref()
+            .map(|d| d.line_marks(lines.len()))
+            .unwrap_or_default();
+
+        self.selection = None;
+        self.outline_want = None; // 履歴ファイルなので LSP/アウトラインは無し。
+        self.open = Some(OpenFile {
+            path: PathBuf::from(&rel),
+            lines,
+            raw_lines,
+            diff,
+            scroll: 0,
+            diff_scroll: 0,
+            cursor_line: 0,
+            cursor_col: 0,
+            outline: Vec::new(),
+            outline_source: OutlineSource::TreeSitter,
+            outline_selected: 0,
+            change_marks,
+        });
+    }
+
+    /// コミット一覧の表示データ（タイトル, 行）。
+    pub fn commit_list_rows(&self, limit: usize) -> (String, Vec<ListRow>) {
+        let title = if self.on_default_branch {
+            format!("Log ({}) — {}", self.commits.len(), self.default_branch_label)
+        } else {
+            format!("Commits ({}) vs {}", self.commits.len(), self.default_branch_label)
+        };
+        let offset = list_offset(self.commit_selected, limit);
+        let rows = self
+            .commits
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(limit)
+            .map(|(i, c)| ListRow {
+                label: format!("{} {} {}", c.date, c.short, c.summary),
+                status: None,
+                selected: i == self.commit_selected,
+            })
+            .collect();
+        (title, rows)
+    }
+
+    /// 選択中コミットの変更ファイル一覧の表示データ（タイトル, 行）。
+    pub fn commit_file_rows(&self, limit: usize) -> (String, Vec<ListRow>) {
+        let title = format!("Files ({})", self.commit_files.len());
+        let offset = list_offset(self.commit_file_selected, limit);
+        let rows = self
+            .commit_files
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(limit)
+            .map(|(i, f)| ListRow {
+                label: f.rel.clone(),
+                status: Some(f.status),
+                selected: i == self.commit_file_selected,
+            })
+            .collect();
+        (title, rows)
     }
 
     /// ファイルを読み込み、ハイライト・差分・アウトラインを用意して開く。
@@ -2405,6 +2762,66 @@ fn c() {}
             app.open_file(&path);
             assert_eq!(app.changed[app.changed_selected].abs, path);
         }
+    }
+
+    #[test]
+    fn commit_view_loads_first_file_diff() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        app.dispatch(Action::ToggleCommits);
+        assert_eq!(app.view_mode, ViewMode::Commits);
+        assert!(!app.commits.is_empty(), "repo should have commits");
+        // 先頭コミットの変更ファイルが読み込まれ、先頭ファイルの差分が開く。
+        assert!(!app.commit_files.is_empty(), "commit should touch files");
+        let open = app.open.as_ref().expect("a commit file is opened");
+        assert!(open.diff.is_some(), "commit file should have a diff");
+        // 左上ペインはコミット一覧。
+        let (title, rows) = app.commit_list_rows(100);
+        assert!(title.contains("Log") || title.contains("Commits"), "{title}");
+        assert!(!rows.is_empty());
+        // `c` をもう一度でコードモードへ戻る。
+        app.dispatch(Action::ToggleCommits);
+        assert_eq!(app.view_mode, ViewMode::Code);
+    }
+
+    #[test]
+    fn commit_view_navigates_commits_and_files() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        app.dispatch(Action::ToggleCommits);
+        if app.commits.len() < 2 {
+            return;
+        }
+        // コミット一覧（Focus::Tree）で下移動 → 別コミットを選択し直す。
+        app.focus = Focus::Tree;
+        app.tree_action(Action::Down);
+        assert_eq!(app.commit_selected, 1);
+        // ファイル一覧（Focus::Outline）で複数ファイルがあれば下移動で切替。
+        if app.commit_files.len() >= 2 {
+            app.focus = Focus::Outline;
+            app.outline_action(Action::Down);
+            assert_eq!(app.commit_file_selected, 1);
+        }
+    }
+
+    #[test]
+    fn branch_list_navigation_clamps() {
+        let entry = |name: &str, head: bool| BranchEntry {
+            display: name.to_string(),
+            target: name.to_string(),
+            is_head: head,
+            is_remote: false,
+        };
+        let mut bl = BranchList {
+            entries: vec![entry("main", true), entry("feature", false)],
+            selected: 0,
+        };
+        bl.move_down();
+        assert_eq!(bl.selected, 1);
+        bl.move_down(); // 末尾でクランプ
+        assert_eq!(bl.selected, 1);
+        bl.move_up();
+        assert_eq!(bl.selected, 0);
+        bl.move_up(); // 先頭でクランプ
+        assert_eq!(bl.selected, 0);
     }
 
     #[test]
