@@ -64,6 +64,12 @@ pub enum Action {
     ToggleJumps,
     /// コミットビュー（デフォルトブランチとの差分コミット一覧）の表示/非表示を切替。
     ToggleCommits,
+    /// PR 差分ビュー（デフォルトブランチとの変更ファイル一覧＋差分）の表示/非表示を切替。
+    ToggleBranchDiff,
+    /// 次の変更ブロックへジャンプ（コードビュー=カーソル / 差分=スクロール）。
+    NextChange,
+    /// 前の変更ブロックへジャンプ。
+    PrevChange,
     /// ブランチ切替ピッカーを開く（origin fetch → 一覧 → 選択で checkout）。
     SwitchBranch,
 }
@@ -107,6 +113,9 @@ impl Action {
             "jump_forward" | "forward" => Self::JumpForward,
             "toggle_jumps" | "jumps" => Self::ToggleJumps,
             "toggle_commits" | "commits" => Self::ToggleCommits,
+            "toggle_branch_diff" | "branch_diff" | "pr" => Self::ToggleBranchDiff,
+            "next_change" | "change_next" => Self::NextChange,
+            "prev_change" | "change_prev" => Self::PrevChange,
             "switch_branch" | "branch" | "branches" => Self::SwitchBranch,
             _ => return None,
         })
@@ -253,6 +262,10 @@ impl Keymap {
         add(ctrl('o'), JumpBack);
         add(ch('J'), ToggleJumps); // 右のジャンプ履歴ペイン表示切替
         add(ch('c'), ToggleCommits); // コミットビュー（デフォルトブランチとの差分）
+        add(ch('C'), ToggleBranchDiff); // PR 差分ビュー（デフォルトブランチとの変更ファイル一覧＋差分）
+        // 変更ブロックへのジャンプ。] [（ファイル）と対になる } {（変更）。コード/差分の両方で効く。
+        add(ch('}'), NextChange);
+        add(ch('{'), PrevChange);
         add(ctrl('v'), SwitchBranch); // ブランチ切替（origin fetch → 一覧 → checkout）
 
         Self { map }

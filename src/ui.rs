@@ -8,7 +8,7 @@ use crate::app::{
     App, BranchList, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, RefList,
     SelRegion, ViewMode,
 };
-use crate::diffview::LineMark;
+use crate::diffview::{LineMark, RowChange};
 use crate::finder::Finder;
 use crate::git::FileStatus;
 use crate::tree::Row;
@@ -325,6 +325,8 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
         ViewMode::Diff => "Diff",
         ViewMode::Commits if app.effective_split() => "Commit (split)",
         ViewMode::Commits => "Commit",
+        ViewMode::Branch if app.effective_split() => "PR (split)",
+        ViewMode::Branch => "PR",
         ViewMode::Code => "Code",
     };
     let title = match &app.open {
@@ -347,7 +349,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     match app.view_mode {
-        ViewMode::Diff | ViewMode::Commits if open.has_diff() => {
+        ViewMode::Diff | ViewMode::Commits | ViewMode::Branch if open.has_diff() => {
             render_diff(frame, inner, open, app.effective_split())
         }
         ViewMode::Diff => {
@@ -356,7 +358,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
                 inner,
             );
         }
-        ViewMode::Commits => {
+        ViewMode::Commits | ViewMode::Branch => {
             frame.render_widget(
                 Paragraph::new(Line::from("(no textual diff for this file)").dim()),
                 inner,
@@ -398,6 +400,14 @@ fn render_code(
     search: &str,
     sel: Option<&SelRegion>,
 ) {
+    // 右端 1 桁を変更オーバービュー・バーに割り当て、残りをコード本文にする。
+    let (area, bar_area) = if area.width > 2 {
+        let [c, b] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        (c, Some(b))
+    } else {
+        (area, None)
+    };
     let height = area.height as usize;
     let total = open.lines.len();
     let num_width = total.to_string().len().max(3);
@@ -453,6 +463,19 @@ fn render_code(
         .collect();
 
     frame.render_widget(Paragraph::new(lines), area);
+
+    // 変更行の在処を右端のミニマップで可視化（gutter 印と同じ色分け）。
+    if let Some(bar_area) = bar_area {
+        let changes: Vec<RowChange> = (0..total)
+            .map(|i| match open.change_marks.get(i).copied().unwrap_or(LineMark::None) {
+                LineMark::Added => RowChange::Add,
+                LineMark::Modified => RowChange::Mod,
+                LineMark::DeletedAbove => RowChange::Del,
+                LineMark::None => RowChange::None,
+            })
+            .collect();
+        render_overview_bar(frame, bar_area, &changes, total, open.scroll, height);
+    }
 }
 
 /// 行 `i` の選択範囲を (開始 char, 終了 char(排他), 行末まで埋めるか) で返す。
@@ -505,49 +528,119 @@ fn apply_selection(spans: &[Span<'static>], start: usize, end: usize) -> Vec<Spa
 
 fn render_diff(frame: &mut Frame, area: Rect, open: &OpenFile, split: bool) {
     let Some(diff) = &open.diff else { return };
-    let height = area.height as usize;
 
-    let unified = |frame: &mut Frame| {
-        let lines: Vec<Line> = diff
-            .rows
-            .iter()
-            .skip(open.diff_scroll)
-            .take(height)
-            .cloned()
-            .collect();
-        frame.render_widget(Paragraph::new(lines), area);
+    // 右端 1 桁を変更オーバービュー・バーに割り当て、残りを差分本文にする。
+    let (content_area, bar_area) = if area.width > 2 {
+        let [c, b] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        (c, Some(b))
+    } else {
+        (area, None)
     };
+    let height = content_area.height as usize;
+    // 長い行が幅に収まらないときの横スクロール量（桁）。
+    let hscroll = open.diff_hscroll as u16;
 
     // split 指定でも未構築なら unified にフォールバック（通常は draw 側で構築済み）。
-    let split_rows = match (split, diff.split_rows()) {
-        (true, Some(rows)) => rows,
-        _ => {
-            unified(frame);
-            return;
+    match (split, diff.split_rows()) {
+        (true, Some(split_rows)) => {
+            // side-by-side: 左=旧 / 中=区切り / 右=新。
+            let [left_area, sep_area, right_area] = Layout::horizontal([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .areas(content_area);
+
+            let mut lefts = Vec::with_capacity(height);
+            let mut rights = Vec::with_capacity(height);
+            for row in split_rows.iter().skip(open.diff_scroll).take(height) {
+                lefts.push(row.left.clone());
+                rights.push(row.right.clone());
+            }
+            let seps: Vec<Line> = (0..lefts.len())
+                .map(|_| Line::styled("│", Style::default().fg(Color::DarkGray)))
+                .collect();
+
+            frame.render_widget(Paragraph::new(lefts).scroll((0, hscroll)), left_area);
+            frame.render_widget(Paragraph::new(seps), sep_area);
+            frame.render_widget(Paragraph::new(rights).scroll((0, hscroll)), right_area);
         }
+        _ => {
+            let lines: Vec<Line> = diff
+                .rows
+                .iter()
+                .skip(open.diff_scroll)
+                .take(height)
+                .cloned()
+                .collect();
+            frame.render_widget(Paragraph::new(lines).scroll((0, hscroll)), content_area);
+        }
+    }
+
+    if let Some(bar_area) = bar_area {
+        render_overview_bar(
+            frame,
+            bar_area,
+            diff.row_changes_for(split),
+            diff.row_count(split),
+            open.diff_scroll,
+            height,
+        );
+    }
+}
+
+/// 右端の変更オーバービュー・バー（ミニマップ）。ファイル全体を縦に圧縮し、
+/// 変更行の位置を色で示す。現在の表示範囲（ビューポート）は背景で強調する。
+fn render_overview_bar(
+    frame: &mut Frame,
+    area: Rect,
+    changes: &[RowChange],
+    total: usize,
+    scroll: usize,
+    viewport: usize,
+) {
+    let h = area.height as usize;
+    if h == 0 || total == 0 {
+        return;
+    }
+    let view_start = scroll;
+    let view_end = (scroll + viewport).min(total);
+    const VIEW_BG: Color = Color::Rgb(48, 52, 66);
+
+    // 種別の強さ（範囲内で最も目立つ変更を採用）。
+    let rank = |c: RowChange| match c {
+        RowChange::None => 0,
+        RowChange::Add => 1,
+        RowChange::Del => 2,
+        RowChange::Mod => 3,
     };
 
-    // side-by-side: 左=旧 / 中=区切り / 右=新。
-    let [left_area, sep_area, right_area] = Layout::horizontal([
-        Constraint::Percentage(50),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-
-    let mut lefts = Vec::with_capacity(height);
-    let mut rights = Vec::with_capacity(height);
-    for row in split_rows.iter().skip(open.diff_scroll).take(height) {
-        lefts.push(row.left.clone());
-        rights.push(row.right.clone());
+    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    for y in 0..h {
+        // このバー行が対応する diff 表示行範囲 [lo, hi)。
+        let lo = y * total / h;
+        let hi = ((y + 1) * total / h).max(lo + 1).min(total);
+        let mut mark = RowChange::None;
+        for &c in &changes[lo.min(changes.len())..hi.min(changes.len())] {
+            if rank(c) > rank(mark) {
+                mark = c;
+            }
+        }
+        let in_view = lo < view_end && hi > view_start;
+        let (glyph, fg) = match mark {
+            RowChange::Add => ("█", Color::Green),
+            RowChange::Del => ("█", Color::Red),
+            RowChange::Mod => ("█", Color::Blue),
+            RowChange::None => (" ", Color::DarkGray),
+        };
+        let mut style = Style::default().fg(fg);
+        if in_view {
+            style = style.bg(VIEW_BG);
+        }
+        lines.push(Line::styled(glyph, style));
     }
-    let seps: Vec<Line> = (0..lefts.len())
-        .map(|_| Line::styled("│", Style::default().fg(Color::DarkGray)))
-        .collect();
-
-    frame.render_widget(Paragraph::new(lefts), left_area);
-    frame.render_widget(Paragraph::new(seps), sep_area);
-    frame.render_widget(Paragraph::new(rights), right_area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// 端末カーソルをコード上のカーソル位置に置く。
@@ -617,9 +710,24 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("Tab", "pane"),
             ("j/k", "commit/file"),
             ("] [", "Next/Prev File"),
-            ("n/N", "hunk"),
+            ("n/N", "change"),
+            ("h/l", "scroll x"),
             ("s", "split"),
+            ("d", "code"),
             ("c", "exit commits"),
+            ("^R", "reload"),
+        ]
+    } else if app.view_mode == ViewMode::Branch {
+        vec![
+            ("q", "quit"),
+            ("Tab", "pane"),
+            ("j/k", "file"),
+            ("] [", "Next/Prev File"),
+            ("n/N", "change"),
+            ("h/l", "scroll x"),
+            ("s", "split"),
+            ("d", "code"),
+            ("C", "exit PR"),
             ("^R", "reload"),
         ]
     } else if app.view_mode == ViewMode::Diff {
@@ -627,11 +735,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("q", "quit"),
             ("Tab", "pane"),
             ("] [", "Next/Prev File"),
-            ("n/N", "hunk"),
+            ("n/N", "change"),
+            ("h/l", "scroll x"),
             ("s", "split"),
             ("d", "code"),
             ("c", "commits"),
-            ("^P", "Find File"),
+            ("C", "PR diff"),
             ("^F", "Search Text"),
             ("/", find_word),
             ("^R", "reload"),
@@ -646,10 +755,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("/", find_word),
             ("gd", "def"),
             ("gr", "refs"),
+            ("n/N", "search/change"),
+            ("} {", "change"),
             ("( )", "jump back/fwd"),
             ("J", "jumps pane"),
             ("d", "diff"),
             ("c", "commits"),
+            ("C", "PR diff"),
             ("^V", "branch"),
             ("v/V/y", "yank"),
             ("Y", "loc"),

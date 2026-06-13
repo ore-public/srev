@@ -88,8 +88,22 @@ pub struct CommitLog {
     pub default_branch: String,
 }
 
+/// デフォルトブランチとの差分（PR 単位）の取得結果。
+pub struct BranchDiff {
+    /// merge-base(default, HEAD) → HEAD で変更されたファイル一覧。
+    pub files: Vec<CommitFile>,
+    /// 基準となるデフォルトブランチ名（表示用）。
+    pub default_branch: String,
+    /// HEAD がデフォルトと同一（マージベース==HEAD）で差分が無いか。
+    pub on_default: bool,
+}
+
 /// 全履歴表示時のコミット数上限（巨大リポジトリでの一括構築を避ける）。
 const MAX_COMMITS: usize = 2000;
+
+/// 表示用 diff のコンテキスト行数。ファイル全体を文脈として出し、変更点から
+/// 離れた未変更行も省略しない（hunk の畳み込みをしない）。libgit2 は実質「全行」扱い。
+const FULL_FILE_CONTEXT: u32 = u32::MAX;
 
 pub struct GitInfo {
     repo: Repository,
@@ -154,6 +168,7 @@ impl GitInfo {
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)
             .show_untracked_content(true)
+            .context_lines(FULL_FILE_CONTEXT)
             .pathspec(rel.to_string_lossy().to_string());
 
         let diff = self
@@ -286,7 +301,7 @@ impl GitInfo {
         let tree = commit.tree().ok();
         let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
         let mut opts = DiffOptions::new();
-        opts.pathspec(rel);
+        opts.context_lines(FULL_FILE_CONTEXT).pathspec(rel);
         let Ok(diff) = self.repo.diff_tree_to_tree(
             parent_tree.as_ref(),
             tree.as_ref(),
@@ -312,6 +327,85 @@ impl GitInfo {
             Some(b) => String::from_utf8_lossy(b.content()).into_owned(),
             None => String::new(),
         }
+    }
+
+    /// デフォルトブランチとの差分（PR 単位）の基準を解決する。
+    /// 返り値: `(マージベース Oid, HEAD Oid, デフォルトブランチ名, on_default)`。
+    /// `on_default` は HEAD がマージベースと同一＝デフォルトとの固有差分が無いとき true。
+    fn branch_base(&self) -> Option<(Oid, Oid, String, bool)> {
+        let head = self.repo.head().ok()?.peel_to_commit().ok()?.id();
+        let default = self.default_branch();
+        let default_oid = self.default_branch_oid(&default)?;
+        // マージベースが取れない（無関係な履歴）ときはデフォルト先端を基準にする。
+        let base = self
+            .repo
+            .merge_base(head, default_oid)
+            .unwrap_or(default_oid);
+        let on_default = base == head;
+        Some((base, head, default, on_default))
+    }
+
+    /// デフォルトブランチとの差分で変更されたファイル一覧（merge-base→HEAD）。
+    pub fn branch_diff(&self) -> BranchDiff {
+        let Some((base, head, default_branch, on_default)) = self.branch_base() else {
+            return BranchDiff {
+                files: Vec::new(),
+                default_branch: self.default_branch(),
+                on_default: true,
+            };
+        };
+        let mut out = BranchDiff {
+            files: Vec::new(),
+            default_branch,
+            on_default,
+        };
+        if on_default {
+            return out; // 固有差分が無い（デフォルト上、または分岐していない）。
+        }
+        let base_tree = self.repo.find_commit(base).ok().and_then(|c| c.tree().ok());
+        let head_tree = self.repo.find_commit(head).ok().and_then(|c| c.tree().ok());
+        let Ok(diff) =
+            self.repo
+                .diff_tree_to_tree(base_tree.as_ref(), head_tree.as_ref(), None)
+        else {
+            return out;
+        };
+        for delta in diff.deltas() {
+            let path = delta.new_file().path().or_else(|| delta.old_file().path());
+            let Some(path) = path else { continue };
+            out.files.push(CommitFile {
+                rel: path.to_string_lossy().to_string(),
+                status: status_of_delta(delta.status()),
+            });
+        }
+        out
+    }
+
+    /// デフォルトブランチとの 1 ファイル分の差分（merge-base→HEAD、全行コンテキスト）。
+    pub fn branch_file_diff(&self, rel: &str) -> Vec<DiffLine> {
+        let Some((base, head, _, _)) = self.branch_base() else {
+            return Vec::new();
+        };
+        let base_tree = self.repo.find_commit(base).ok().and_then(|c| c.tree().ok());
+        let head_tree = self.repo.find_commit(head).ok().and_then(|c| c.tree().ok());
+        let mut opts = DiffOptions::new();
+        opts.context_lines(FULL_FILE_CONTEXT).pathspec(rel);
+        let Ok(diff) = self.repo.diff_tree_to_tree(
+            base_tree.as_ref(),
+            head_tree.as_ref(),
+            Some(&mut opts),
+        ) else {
+            return Vec::new();
+        };
+        collect_diff_lines(&diff)
+    }
+
+    /// HEAD 時点でのファイル内容（差分の「新」側ハイライト用）。
+    pub fn branch_file_content(&self, rel: &str) -> String {
+        let Some((_, head, _, _)) = self.branch_base() else {
+            return String::new();
+        };
+        self.commit_file_new_content(head, rel)
     }
 
     /// `origin` から fetch する（ブランチ一覧を出す前に最新化）。成功なら `true`。
@@ -502,6 +596,74 @@ mod tests {
         let diff = info.commit_file_diff(addb.id, "b.txt");
         assert!(diff.iter().any(|l| l.kind == DiffKind::Add && l.content == "new"));
         assert_eq!(info.commit_file_new_content(addb.id, "b.txt"), "new\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_diff_uses_merge_base_and_full_context() {
+        let dir = std::env::temp_dir().join(format!("srev_bdiff_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "tester"]);
+        // 共通の祖先（マージベース）。a.txt は未変更行を多く持たせる。
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        // feature ブランチで a.txt を一部変更し、b.txt を追加。
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        git(&dir, &["commit", "-qam", "edit a"]);
+        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "add b"]);
+
+        // 分岐後に main を進める（three-dot 差分には現れないはず）。
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("c.txt"), "main only\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "main advance"]);
+        git(&dir, &["checkout", "-q", "feature"]);
+
+        let info = GitInfo::discover(&dir).expect("repo");
+        let bd = info.branch_diff();
+        assert_eq!(bd.default_branch, "main");
+        assert!(!bd.on_default, "feature has a branch diff");
+        let rels: Vec<&str> = bd.files.iter().map(|f| f.rel.as_str()).collect();
+        assert!(rels.contains(&"a.txt"), "{rels:?}");
+        assert!(rels.contains(&"b.txt"), "{rels:?}");
+        // main の分岐後コミットは three-dot 差分に含めない。
+        assert!(!rels.contains(&"c.txt"), "c.txt is main-only after divergence: {rels:?}");
+        assert!(
+            bd.files.iter().any(|f| f.rel == "b.txt" && f.status == FileStatus::Added)
+        );
+
+        // b.txt の内容と差分。
+        assert_eq!(info.branch_file_content("b.txt"), "new\n");
+        let bdiff = info.branch_file_diff("b.txt");
+        assert!(bdiff.iter().any(|l| l.kind == DiffKind::Add && l.content == "new"));
+
+        // a.txt は 1 行だけ変わったが、全行コンテキストで未変更行も Context として出る。
+        let adiff = info.branch_file_diff("a.txt");
+        assert!(adiff.iter().any(|l| l.kind == DiffKind::Add && l.content == "TWO"));
+        assert!(adiff.iter().any(|l| l.kind == DiffKind::Del && l.content == "two"));
+        for unchanged in ["one", "three", "four"] {
+            assert!(
+                adiff.iter().any(|l| l.kind == DiffKind::Context && l.content == unchanged),
+                "未変更行 {unchanged:?} が省略されず Context として出るべき: {adiff:?}"
+            );
+        }
+
+        // デフォルトブランチ上では固有差分は無い（on_default）。
+        git(&dir, &["checkout", "-q", "main"]);
+        let info_main = GitInfo::discover(&dir).expect("repo");
+        let bd_main = info_main.branch_diff();
+        assert!(bd_main.on_default, "on main there is no branch-specific diff");
+        assert!(bd_main.files.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

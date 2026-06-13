@@ -17,13 +17,17 @@ pub struct DiffRender {
     pub rows: Vec<Line<'static>>,
     /// 各行が対応するフルコードの行インデックス（0 始まり）。トグル時の行保持に使う。
     pub to_code: Vec<Option<usize>>,
-    /// hunk 見出し行（`@@ ... @@`）の行インデックス。hunk ジャンプに使う。
-    pub hunk_rows: Vec<usize>,
+    /// unified 各表示行の変更種別（オーバービュー・バー用、`rows` と同長）。
+    row_changes: Vec<RowChange>,
+    /// unified の変更ブロック先頭行（`n`/`N` ジャンプ用）。全行表示で `@@` が 1 つに
+    /// 集約されても、変更の塊ごとに辿れる。
+    change_anchors: Vec<usize>,
     /// 新規/削除ファイル（文脈なし・片側のみ）。split 既定でも単一表示にする。
     pub single_column: bool,
     /// side-by-side は遅延構築（実際に左右表示するまで作らない）。
     split: Option<Vec<SplitRow>>,
-    split_hunk_rows: Option<Vec<usize>>,
+    split_row_changes: Option<Vec<RowChange>>,
+    split_change_anchors: Option<Vec<usize>>,
     /// 遅延構築のために元データを保持。
     raw: Vec<DiffLine>,
     syntax: Syntax,
@@ -33,6 +37,30 @@ pub struct DiffRender {
 pub struct SplitRow {
     pub left: Line<'static>,
     pub right: Line<'static>,
+}
+
+/// 差分の表示行 1 行ぶんの変更種別（右端オーバービュー・バーの色付け用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowChange {
+    None,
+    Add,
+    Del,
+    /// 削除と追加が対になった行（side-by-side の左右が埋まる行）。
+    Mod,
+}
+
+/// 変更行の連なり（ブロック）の先頭インデックス列を求める（`n`/`N` ジャンプ用）。
+fn anchors_from(changes: &[RowChange]) -> Vec<usize> {
+    let mut anchors = Vec::new();
+    let mut prev_changed = false;
+    for (i, c) in changes.iter().enumerate() {
+        let changed = *c != RowChange::None;
+        if changed && !prev_changed {
+            anchors.push(i);
+        }
+        prev_changed = changed;
+    }
+    anchors
 }
 
 /// コードビューの gutter に出す行ごとの変更印（エディタ風）。
@@ -101,9 +129,10 @@ impl DiffRender {
         if self.split.is_some() {
             return;
         }
-        let (split, hunks) = build_split(&self.raw, code_lines, highlighter, self.syntax);
+        let (split, changes) = build_split(&self.raw, code_lines, highlighter, self.syntax);
+        self.split_change_anchors = Some(anchors_from(&changes));
+        self.split_row_changes = Some(changes);
         self.split = Some(split);
-        self.split_hunk_rows = Some(hunks);
     }
 
     /// 構築済みなら side-by-side 行を返す。
@@ -120,12 +149,21 @@ impl DiffRender {
         }
     }
 
-    /// 表示中の表現の hunk 見出し行インデックス。
-    pub fn hunk_rows_for(&self, split: bool) -> &[usize] {
+    /// 表示中の表現の変更ブロック先頭行インデックス（`n`/`N` ジャンプ用）。
+    pub fn change_anchors_for(&self, split: bool) -> &[usize] {
         if split {
-            self.split_hunk_rows.as_deref().unwrap_or(&[])
+            self.split_change_anchors.as_deref().unwrap_or(&[])
         } else {
-            &self.hunk_rows
+            &self.change_anchors
+        }
+    }
+
+    /// 表示中の表現の各行の変更種別（オーバービュー・バー用）。
+    pub fn row_changes_for(&self, split: bool) -> &[RowChange] {
+        if split {
+            self.split_row_changes.as_deref().unwrap_or(&[])
+        } else {
+            &self.row_changes
         }
     }
 }
@@ -139,12 +177,16 @@ pub fn build(
 ) -> DiffRender {
     let mut rows = Vec::with_capacity(diff.len());
     let mut to_code = Vec::with_capacity(diff.len());
-    let mut hunk_rows = Vec::new();
+    let mut row_changes = Vec::with_capacity(diff.len());
 
     for dl in diff {
+        row_changes.push(match dl.kind {
+            DiffKind::Add => RowChange::Add,
+            DiffKind::Del => RowChange::Del,
+            DiffKind::Hunk | DiffKind::Context => RowChange::None,
+        });
         match dl.kind {
             DiffKind::Hunk => {
-                hunk_rows.push(rows.len());
                 rows.push(Line::styled(
                     dl.content.clone(),
                     Style::default().fg(Color::Cyan),
@@ -183,13 +225,16 @@ pub fn build(
         }
     }
 
+    let change_anchors = anchors_from(&row_changes);
     DiffRender {
         rows,
         to_code,
-        hunk_rows,
+        row_changes,
+        change_anchors,
         single_column: is_whole_file_change(diff),
         split: None,
-        split_hunk_rows: None,
+        split_row_changes: None,
+        split_change_anchors: None,
         raw: diff.to_vec(),
         syntax,
     }
@@ -211,15 +256,15 @@ fn is_whole_file_change(diff: &[DiffLine]) -> bool {
 }
 
 /// side-by-side 行を組み立てる。削除/追加の連続ブロックを左右に並べ、
-/// 数が合わない分は空行で埋める。
+/// 数が合わない分は空行で埋める。返り値は (split 行, 各行の変更種別)。
 fn build_split(
     diff: &[DiffLine],
     code_lines: &[Line<'static>],
     highlighter: &mut CodeHighlighter,
     syntax: Syntax,
-) -> (Vec<SplitRow>, Vec<usize>) {
+) -> (Vec<SplitRow>, Vec<RowChange>) {
     let mut split: Vec<SplitRow> = Vec::new();
-    let mut hunk_rows: Vec<usize> = Vec::new();
+    let mut changes: Vec<RowChange> = Vec::new();
     let mut pdel: Vec<&DiffLine> = Vec::new();
     let mut padd: Vec<&DiffLine> = Vec::new();
 
@@ -228,30 +273,32 @@ fn build_split(
             DiffKind::Del => pdel.push(dl),
             DiffKind::Add => padd.push(dl),
             DiffKind::Hunk => {
-                drain_changes(&mut split, &mut pdel, &mut padd, code_lines, highlighter, syntax);
-                hunk_rows.push(split.len());
+                drain_changes(&mut split, &mut changes, &mut pdel, &mut padd, code_lines, highlighter, syntax);
                 split.push(SplitRow {
                     left: Line::styled(dl.content.clone(), Style::default().fg(Color::Cyan)),
                     right: Line::from(""),
                 });
+                changes.push(RowChange::None);
             }
             DiffKind::Context => {
-                drain_changes(&mut split, &mut pdel, &mut padd, code_lines, highlighter, syntax);
+                drain_changes(&mut split, &mut changes, &mut pdel, &mut padd, code_lines, highlighter, syntax);
                 let content = code_line_for(dl.new_lineno, code_lines);
                 split.push(SplitRow {
                     left: side_line(dl.old_lineno, ' ', None, content),
                     right: side_line(dl.new_lineno, ' ', None, content),
                 });
+                changes.push(RowChange::None);
             }
         }
     }
-    drain_changes(&mut split, &mut pdel, &mut padd, code_lines, highlighter, syntax);
-    (split, hunk_rows)
+    drain_changes(&mut split, &mut changes, &mut pdel, &mut padd, code_lines, highlighter, syntax);
+    (split, changes)
 }
 
-/// 溜まった削除/追加を左右ペアにして split へ流し込む。
+/// 溜まった削除/追加を左右ペアにして split へ流し込む。各行の変更種別も併記する。
 fn drain_changes(
     split: &mut Vec<SplitRow>,
+    changes: &mut Vec<RowChange>,
     pdel: &mut Vec<&DiffLine>,
     padd: &mut Vec<&DiffLine>,
     code_lines: &[Line<'static>],
@@ -276,6 +323,12 @@ fn drain_changes(
             ),
             None => Line::from(""),
         };
+        // 左右の埋まり方で種別を決める（両方=変更 / 右のみ=追加 / 左のみ=削除）。
+        changes.push(match (pdel.get(i).is_some(), padd.get(i).is_some()) {
+            (true, true) => RowChange::Mod,
+            (false, true) => RowChange::Add,
+            _ => RowChange::Del,
+        });
         split.push(SplitRow { left, right });
     }
     pdel.clear();
@@ -348,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn split_pairs_changes_and_records_hunks() {
+    fn split_pairs_changes_and_marks_block() {
         let mut h = CodeHighlighter::new();
         let plain = h.plain();
         let code_lines = vec![Line::from("ctx"), Line::from("new1")];
@@ -358,10 +411,13 @@ mod tests {
             dl(DiffKind::Del, Some(2), None, "old"),
             dl(DiffKind::Add, None, Some(2), "new1"),
         ];
-        let (split, hunks) = build_split(&diff, &code_lines, &mut h, plain);
+        let (split, changes) = build_split(&diff, &code_lines, &mut h, plain);
         // hunk(1) + context(1) + del/add ペア(1) = 3 行
         assert_eq!(split.len(), 3, "split rows");
-        assert_eq!(hunks, vec![0]);
+        // 先頭2行は変更なし、3行目が削除を伴う追加＝変更。
+        assert_eq!(changes, vec![RowChange::None, RowChange::None, RowChange::Mod]);
+        // 変更ブロックの先頭は 3 行目（index 2）。
+        assert_eq!(anchors_from(&changes), vec![2]);
     }
 
     #[test]
@@ -447,5 +503,33 @@ mod tests {
         ];
         let (split, _) = build_split(&diff, &code_lines, &mut h, plain);
         assert_eq!(split.len(), 2, "padded to max(del,add)");
+    }
+
+    #[test]
+    fn unified_row_changes_and_anchors_two_blocks() {
+        let mut h = CodeHighlighter::new();
+        let plain = h.plain();
+        let code = vec![Line::from("a"), Line::from("b"), Line::from("c"), Line::from("d")];
+        // ctx / 追加(塊1) / ctx / 削除(塊2) / ctx
+        let diff = vec![
+            dl(DiffKind::Context, Some(1), Some(1), "a"),
+            dl(DiffKind::Add, None, Some(2), "b"),
+            dl(DiffKind::Context, Some(2), Some(3), "c"),
+            dl(DiffKind::Del, Some(3), None, "x"),
+            dl(DiffKind::Context, Some(4), Some(4), "d"),
+        ];
+        let r = build(&diff, &code, &mut h, plain);
+        assert_eq!(
+            r.row_changes_for(false),
+            &[
+                RowChange::None,
+                RowChange::Add,
+                RowChange::None,
+                RowChange::Del,
+                RowChange::None
+            ]
+        );
+        // 変更ブロックは 2 つ（index 1 と 3）。
+        assert_eq!(r.change_anchors_for(false), &[1, 3]);
     }
 }

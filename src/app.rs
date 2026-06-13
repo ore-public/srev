@@ -33,6 +33,8 @@ pub enum ViewMode {
     Code,
     /// コミットビュー：左上=コミット一覧、左下=変更ファイル、右=ファイル差分。
     Commits,
+    /// PR 差分ビュー：左上=デフォルトブランチとの変更ファイル一覧、右=差分（merge-base→HEAD）。
+    Branch,
 }
 
 /// visual mode の選択。アンカーを固定し、もう一端はカーソル。
@@ -171,6 +173,8 @@ enum NavList {
     AllFiles,
     /// 選択中コミットの変更ファイル（コミットビュー）。
     CommitFiles,
+    /// デフォルトブランチとの変更ファイル（PR 差分ビュー）。
+    BranchFiles,
 }
 
 /// 左上ペインの描画指示（ui へ渡す）。
@@ -235,6 +239,8 @@ pub struct OpenFile {
     /// コード表示のスクロール（ビューポート先頭行）。
     pub scroll: usize,
     pub diff_scroll: usize,
+    /// 差分表示の横スクロール量（桁。長い行が幅に収まらないとき左へずらす）。
+    pub diff_hscroll: usize,
     /// vim ライクカーソル（コード表示時、0 始まり）。
     pub cursor_line: usize,
     pub cursor_col: usize,
@@ -375,6 +381,16 @@ pub struct App {
     on_default_branch: bool,
     /// 基準デフォルトブランチ名（タイトル表示用）。
     default_branch_label: String,
+    /// PR 差分ビュー：デフォルトブランチとの変更ファイル一覧（merge-base→HEAD）。
+    branch_files: Vec<CommitFile>,
+    branch_file_selected: usize,
+    /// PR 差分一覧を構築済みか（初回 `C` で遅延構築）。
+    branch_diff_loaded: bool,
+    /// PR 差分の基準デフォルトブランチ名（タイトル表示用）。
+    branch_default_label: String,
+    /// HEAD がデフォルトと同一（分岐していない）で固有差分が無いか。空表示時の
+    /// メッセージを「デフォルト上」と「差分ゼロ」で出し分けるのに使う。
+    branch_on_default: bool,
     /// 現在チェックアウト中のブランチ名（ステータスバー表示用にキャッシュ）。
     branch: Option<String>,
     git: Option<GitInfo>,
@@ -445,6 +461,11 @@ impl App {
             commits_loaded: false,
             on_default_branch: false,
             default_branch_label: String::new(),
+            branch_files: Vec::new(),
+            branch_file_selected: 0,
+            branch_diff_loaded: false,
+            branch_default_label: String::new(),
+            branch_on_default: false,
             branch,
             git,
             highlighter: CodeHighlighter::new(),
@@ -578,6 +599,9 @@ impl App {
             JumpForward => self.go_forward(),
             ToggleJumps => self.show_jumps = !self.show_jumps,
             ToggleCommits => self.toggle_commit_view(),
+            ToggleBranchDiff => self.toggle_branch_diff(),
+            NextChange => self.change_jump(true),
+            PrevChange => self.change_jump(false),
             SwitchBranch => self.open_branch_list(),
             Reload => self.reload(),
             // 差分モードでは変更ファイル一覧、コードモードでは全ファイルを順送り。
@@ -614,6 +638,20 @@ impl App {
                 Up if self.commit_selected > 0 => self.select_commit(self.commit_selected - 1),
                 // Enter/→ で左下のファイル一覧へフォーカス移動。
                 Activate | Right if !self.commit_files.is_empty() => self.focus = Focus::Outline,
+                _ => {}
+            }
+            return;
+        }
+        // PR 差分ビューでは左上=デフォルトブランチとの変更ファイル一覧を操作する。
+        if self.view_mode == ViewMode::Branch {
+            match action {
+                Down if self.branch_file_selected + 1 < self.branch_files.len() => {
+                    self.open_branch_file(self.branch_file_selected + 1)
+                }
+                Up if self.branch_file_selected > 0 => {
+                    self.open_branch_file(self.branch_file_selected - 1)
+                }
+                Activate | Right if !self.branch_files.is_empty() => self.focus = Focus::Content,
                 _ => {}
             }
             return;
@@ -726,6 +764,18 @@ impl App {
                 .as_ref()
                 .map_or(0, |d| d.row_count(split))
                 .saturating_sub(1);
+            const H_SCROLL_STEP: usize = 8;
+            // 横スクロールのクランプ上限：最長行から最低表示桁ぶんを残した位置まで。
+            // 可視幅はここでは不明なので、末尾付近でも一定桁は残る保守値で抑える
+            // （行末送り `$` で本文がすべて画面外へ消えるのを防ぐ）。
+            const MIN_VISIBLE_COLS: usize = 24;
+            let max_h = open
+                .raw_lines
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(MIN_VISIBLE_COLS);
             match action {
                 Down => open.diff_scroll = (open.diff_scroll + 1).min(last),
                 Up => open.diff_scroll = open.diff_scroll.saturating_sub(1),
@@ -733,6 +783,11 @@ impl App {
                 Bottom => open.diff_scroll = last,
                 HalfPageDown => open.diff_scroll = (open.diff_scroll + 15).min(last),
                 HalfPageUp => open.diff_scroll = open.diff_scroll.saturating_sub(15),
+                // 長い行が幅に収まらないときの横スクロール（h/l, ←/→, 0/$）。
+                Right => open.diff_hscroll = (open.diff_hscroll + H_SCROLL_STEP).min(max_h),
+                Left => open.diff_hscroll = open.diff_hscroll.saturating_sub(H_SCROLL_STEP),
+                LineStart => open.diff_hscroll = 0,
+                LineEnd => open.diff_hscroll = max_h,
                 _ => {}
             }
             return;
@@ -779,8 +834,22 @@ impl App {
             GotoDef => self.goto_definition(),
             GotoReferences => self.goto_references(),
             Find => self.search_input = Some(String::new()),
-            SearchNext => self.search_jump(true),
-            SearchPrev => self.search_jump(false),
+            // 検索中（クエリあり）なら検索の次/前へ。未検索なら変更ブロックを辿る
+            // （差分系モードの n/N、およびコードビューの } { と挙動を揃える）。
+            SearchNext => {
+                if self.search_query.is_empty() {
+                    self.goto_change(true);
+                } else {
+                    self.search_jump(true);
+                }
+            }
+            SearchPrev => {
+                if self.search_query.is_empty() {
+                    self.goto_change(false);
+                } else {
+                    self.search_jump(false);
+                }
+            }
             VisualChar => self.toggle_visual(false),
             VisualLine => self.toggle_visual(true),
             Yank => self.yank_selection(),
@@ -1068,6 +1137,27 @@ impl App {
             };
         }
 
+        if self.view_mode == ViewMode::Branch {
+            let offset = list_offset(self.branch_file_selected, limit);
+            let rows = self
+                .branch_files
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(limit)
+                .map(|(i, f)| ListRow {
+                    label: f.rel.clone(),
+                    status: Some(f.status),
+                    selected: i == self.branch_file_selected,
+                })
+                .collect();
+            return LeftPane::List {
+                title: format!("PR vs {} ({})", self.branch_default_label, self.branch_files.len()),
+                query: None,
+                rows,
+            };
+        }
+
         LeftPane::Tree
     }
 
@@ -1180,6 +1270,14 @@ impl App {
 
     /// コード表示に切り替えて指定行へジャンプ（中央表示）。ジャンプ系で共用。
     fn jump_to_code_line(&mut self, line: usize) {
+        // 履歴/ブランチ内容（HEAD blob 等）を表示中にコードへ飛ぶ場合は、ディスクの
+        // 実ファイルを開き直す（Branch アウトライン経由など。stale な内容を Code 表示しない）。
+        if matches!(self.view_mode, ViewMode::Commits | ViewMode::Branch)
+            && let Some(rel) = self.open.as_ref().map(|o| o.path.clone())
+        {
+            let abs = self.root.join(&rel);
+            self.open_file(&abs);
+        }
         self.view_mode = ViewMode::Code;
         self.focus = Focus::Content;
         self.jump_to_line(line);
@@ -1878,7 +1976,8 @@ impl App {
         self.selection = None;
     }
 
-    /// 差分表示で次/前の hunk 見出し行へジャンプする。端では flash で知らせる。
+    /// 差分表示で次/前の変更ブロックへジャンプする。端では flash で知らせる。
+    /// 全行表示で `@@` が 1 つに集約されても、変更の塊ごとに辿れる。
     fn hunk(&mut self, forward: bool) {
         if !self.diff_content() {
             return;
@@ -1891,15 +1990,76 @@ impl App {
         let Some(diff) = open.diff.as_ref() else {
             return;
         };
-        let target = next_hunk(diff.hunk_rows_for(split), open.diff_scroll, forward);
+        let anchors = diff.change_anchors_for(split);
+        let total = anchors.len();
+        let target = next_hunk(anchors, open.diff_scroll, forward);
+        // 移動先が何番目の変更か（1 始まり）。借用はここで終える。
+        let idx = target.and_then(|t| anchors.iter().position(|&a| a == t)).map(|i| i + 1);
         match target {
-            Some(t) => self.open.as_mut().unwrap().diff_scroll = t,
+            Some(t) => {
+                self.open.as_mut().unwrap().diff_scroll = t;
+                self.flash = Some(format!("change {}/{}", idx.unwrap_or(0), total));
+            }
             None => {
                 self.flash = Some(if forward {
-                    "last hunk".into()
+                    "last change".into()
                 } else {
-                    "first hunk".into()
+                    "first change".into()
                 })
+            }
+        }
+    }
+
+    /// 次/前の変更ブロックへジャンプする。差分表示中はスクロール、コード表示中は
+    /// カーソルを移動する（`}`/`{`）。どちらのモードからでも変更箇所を辿れる。
+    fn change_jump(&mut self, forward: bool) {
+        if self.diff_content() {
+            self.hunk(forward);
+        } else {
+            self.goto_change(forward);
+        }
+    }
+
+    /// コードビューで、HEAD との変更行（gutter の印）ブロックの先頭へカーソルを移す。
+    fn goto_change(&mut self, forward: bool) {
+        // 変更ブロックの先頭行を集める（連続した変更行の塊の頭）。
+        let (anchors, cur) = {
+            let Some(open) = self.open.as_ref() else {
+                return;
+            };
+            let mut anchors: Vec<usize> = Vec::new();
+            let mut prev_changed = false;
+            for (i, m) in open.change_marks.iter().enumerate() {
+                let changed = *m != diffview::LineMark::None;
+                if changed && !prev_changed {
+                    anchors.push(i);
+                }
+                prev_changed = changed;
+            }
+            (anchors, open.cursor_line)
+        };
+        if anchors.is_empty() {
+            self.flash = Some("no changes".into());
+            return;
+        }
+        let target = if forward {
+            anchors.iter().copied().find(|&a| a > cur)
+        } else {
+            anchors.iter().copied().rev().find(|&a| a < cur)
+        };
+        match target {
+            Some(t) => {
+                let idx = anchors.iter().position(|&a| a == t).map(|i| i + 1).unwrap_or(0);
+                if let Some(o) = self.open.as_mut() {
+                    o.cursor_line = t.min(o.last_line());
+                    o.cursor_col = 0;
+                }
+                self.recenter = true; // 飛んだ先を画面中央に。
+                self.flash = Some(format!("change {}/{}", idx, anchors.len()));
+            }
+            None => {
+                self.flash =
+                    Some(if forward { "last change" } else { "first change" }.into());
             }
         }
     }
@@ -1908,6 +2068,7 @@ impl App {
     fn nav_list(&self) -> NavList {
         match self.view_mode {
             ViewMode::Commits => NavList::CommitFiles,
+            ViewMode::Branch => NavList::BranchFiles,
             ViewMode::Diff => NavList::Changed,
             ViewMode::Code => NavList::AllFiles,
         }
@@ -1937,10 +2098,31 @@ impl App {
             }
             return;
         }
+        // PR 差分ビューはデフォルトブランチとの変更ファイルを順送りする。
+        if let NavList::BranchFiles = list {
+            let len = self.branch_files.len();
+            if len == 0 {
+                return;
+            }
+            let last = len - 1;
+            let cur = self.branch_file_selected.min(last);
+            let next = if forward {
+                (cur + 1).min(last)
+            } else {
+                cur.saturating_sub(1)
+            };
+            if next == cur {
+                self.flash = Some(if forward { "last file" } else { "first file" }.into());
+            } else {
+                self.open_branch_file(next);
+                self.focus = Focus::Content;
+            }
+            return;
+        }
         let len = match list {
             NavList::Changed => self.changed.len(),
             NavList::AllFiles => self.all_files.len(),
-            NavList::CommitFiles => 0,
+            NavList::CommitFiles | NavList::BranchFiles => 0,
         };
         if len == 0 {
             return;
@@ -1953,7 +2135,7 @@ impl App {
                 .open
                 .as_ref()
                 .and_then(|o| self.all_files.iter().position(|e| e.abs == o.path)),
-            NavList::CommitFiles => unreachable!(), // 上で早期 return 済み
+            NavList::CommitFiles | NavList::BranchFiles => unreachable!(), // 上で早期 return 済み
         };
         let next = match cur {
             Some(i) if forward => (i + 1).min(last),
@@ -1965,7 +2147,7 @@ impl App {
             let (fwd, bwd) = match list {
                 NavList::Changed => ("last changed file", "first changed file"),
                 NavList::AllFiles => ("last file", "first file"),
-                NavList::CommitFiles => unreachable!(),
+                NavList::CommitFiles | NavList::BranchFiles => unreachable!(),
             };
             self.flash = Some(if forward { fwd } else { bwd }.into());
             return;
@@ -1976,7 +2158,7 @@ impl App {
                 self.changed[next].abs.clone()
             }
             NavList::AllFiles => self.all_files[next].abs.clone(),
-            NavList::CommitFiles => unreachable!(),
+            NavList::CommitFiles | NavList::BranchFiles => unreachable!(),
         };
         self.open_file(&path);
         self.focus = Focus::Content;
@@ -2015,6 +2197,19 @@ impl App {
             return;
         }
 
+        // PR 差分一覧も作り直す（次回 `C` で再構築。表示中なら即時）。
+        self.branch_diff_loaded = false;
+        if self.view_mode == ViewMode::Branch {
+            self.load_branch_diff();
+            if self.branch_files.is_empty() {
+                self.open = None;
+            } else {
+                self.open_branch_file(self.branch_file_selected.min(self.branch_files.len() - 1));
+            }
+            self.flash = Some("reloaded".into());
+            return;
+        }
+
         // 開いているファイルはカーソル・スクロールを保ったまま読み直す。
         if let Some(open) = self.open.as_ref() {
             let path = open.path.clone();
@@ -2035,9 +2230,12 @@ impl App {
         self.flash = Some("reloaded".into());
     }
 
-    /// コンテンツに差分（unified/split）を表示するモードか（Diff・Commits）。
+    /// コンテンツに差分（unified/split）を表示するモードか（Diff・Commits・Branch）。
     fn diff_content(&self) -> bool {
-        matches!(self.view_mode, ViewMode::Diff | ViewMode::Commits)
+        matches!(
+            self.view_mode,
+            ViewMode::Diff | ViewMode::Commits | ViewMode::Branch
+        )
     }
 
     /// 差分 ⇄ コードをトグルする。現在の表示行を保持して相互に対応させる。
@@ -2047,9 +2245,14 @@ impl App {
             self.exit_commit_view();
             return;
         }
+        // PR 差分ビュー中の `d` は PR 差分ビューを抜ける。
+        if self.view_mode == ViewMode::Branch {
+            self.exit_branch_diff();
+            return;
+        }
         self.selection = None;
         let next = match self.view_mode {
-            ViewMode::Commits => ViewMode::Code, // 到達しない（上で処理）
+            ViewMode::Commits | ViewMode::Branch => ViewMode::Code, // 到達しない（上で処理）
             ViewMode::Diff => ViewMode::Code,
             ViewMode::Code => ViewMode::Diff,
         };
@@ -2086,7 +2289,7 @@ impl App {
                 }
             }
             ViewMode::Diff => self.sync_changed_to_open(),
-            ViewMode::Commits => {} // toggle_view_mode は Commits へは遷移しない
+            ViewMode::Commits | ViewMode::Branch => {} // toggle_view_mode はこれらへ遷移しない
         }
     }
 
@@ -2199,6 +2402,7 @@ impl App {
             diff,
             scroll: 0,
             diff_scroll: 0,
+            diff_hscroll: 0,
             cursor_line: 0,
             cursor_col: 0,
             outline: Vec::new(),
@@ -2250,6 +2454,107 @@ impl App {
         (title, rows)
     }
 
+    // --- PR 差分ビュー（デフォルトブランチとの差分） ---
+
+    /// PR 差分ビューの表示/非表示を切り替える（`C`）。
+    fn toggle_branch_diff(&mut self) {
+        if self.view_mode == ViewMode::Branch {
+            self.exit_branch_diff();
+            return;
+        }
+        if self.git.is_none() {
+            self.flash = Some("not a git repository".into());
+            return;
+        }
+        if !self.branch_diff_loaded {
+            self.load_branch_diff();
+        }
+        self.view_mode = ViewMode::Branch;
+        self.focus = Focus::Tree;
+        self.selection = None;
+        if self.branch_files.is_empty() {
+            // 「デフォルトブランチ上（分岐していない）」と「分岐したが差分ゼロ」を区別。
+            self.flash = Some(if self.branch_on_default {
+                format!("on default branch ({}) — no PR diff", self.branch_default_label)
+            } else {
+                format!("no changes vs {}", self.branch_default_label)
+            });
+            self.open = None;
+        } else {
+            let idx = self.branch_file_selected.min(self.branch_files.len() - 1);
+            self.open_branch_file(idx);
+        }
+    }
+
+    /// PR 差分ビューを抜けてコードモードへ戻る。
+    fn exit_branch_diff(&mut self) {
+        self.view_mode = ViewMode::Code;
+        self.focus = Focus::Tree;
+        self.open = None; // 表示していたのは HEAD 時点の内容。ツリーから選び直す。
+    }
+
+    /// デフォルトブランチとの差分一覧を git から構築してキャッシュする。
+    fn load_branch_diff(&mut self) {
+        if let Some(bd) = self.git.as_ref().map(|g| g.branch_diff()) {
+            self.branch_files = bd.files;
+            self.branch_default_label = bd.default_branch;
+            self.branch_on_default = bd.on_default;
+        }
+        self.branch_diff_loaded = true;
+        self.branch_file_selected = 0;
+    }
+
+    /// PR 差分の指定ファイルを Content に開く（HEAD blob + デフォルトブランチとの差分）。
+    /// 履歴 blob ベースなので LSP は使わないが、tree-sitter アウトラインは内容から出す。
+    fn open_branch_file(&mut self, file_idx: usize) {
+        let rel = match self.branch_files.get(file_idx) {
+            Some(f) => f.rel.clone(),
+            None => {
+                self.open = None;
+                return;
+            }
+        };
+        self.branch_file_selected = file_idx;
+
+        let (content, diff_lines) = {
+            let Some(git) = self.git.as_ref() else {
+                return;
+            };
+            (
+                git.branch_file_content(&rel).replace("\r\n", "\n"),
+                git.branch_file_diff(&rel),
+            )
+        };
+        let syntax = self.highlighter.detect(Path::new(&rel));
+        let lines = self.highlighter.highlight(syntax, &content);
+        let raw_lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let outline = self.lang_configs.file_symbols(Path::new(&rel), content.as_bytes());
+        let diff = (!diff_lines.is_empty())
+            .then(|| diffview::build(&diff_lines, &lines, &mut self.highlighter, syntax));
+        let change_marks = diff
+            .as_ref()
+            .map(|d| d.line_marks(lines.len()))
+            .unwrap_or_default();
+
+        self.selection = None;
+        self.outline_want = None; // 履歴 blob なので LSP アウトライン取得はしない。
+        self.open = Some(OpenFile {
+            path: PathBuf::from(&rel),
+            lines,
+            raw_lines,
+            diff,
+            scroll: 0,
+            diff_scroll: 0,
+            diff_hscroll: 0,
+            cursor_line: 0,
+            cursor_col: 0,
+            outline,
+            outline_source: OutlineSource::TreeSitter,
+            outline_selected: 0,
+            change_marks,
+        });
+    }
+
     /// ステータスバー表示用の現在ブランチ名（git リポジトリでなければ `None`）。
     pub fn branch_label(&self) -> Option<String> {
         self.git.as_ref()?;
@@ -2282,7 +2587,10 @@ impl App {
             .filter(|d| !d.is_empty())
             .map(|d| diffview::build(&d, &lines, &mut self.highlighter, syntax));
 
-        if diff.is_none() {
+        // open_file は常に作業ツリーの内容を読む。履歴/ブランチ内容を見せる
+        // Commits/Branch ビューから（^P 等で）直接ファイルを開いた場合は必ず抜ける。
+        // 差分があれば Diff ビューは維持、無ければ Code へ。
+        if diff.is_none() || matches!(self.view_mode, ViewMode::Commits | ViewMode::Branch) {
             self.view_mode = ViewMode::Code;
         }
 
@@ -2300,6 +2608,7 @@ impl App {
             diff,
             scroll: 0,
             diff_scroll: 0,
+            diff_hscroll: 0,
             cursor_line: 0,
             cursor_col: 0,
             outline,
@@ -2467,6 +2776,7 @@ mod tests {
             diff: None,
             scroll: 0,
             diff_scroll: 0,
+            diff_hscroll: 0,
             cursor_line: 0,
             cursor_col: 0,
             outline: Vec::new(),
@@ -2862,6 +3172,230 @@ fn c() {}
             app.outline_action(Action::Down);
             assert_eq!(app.commit_file_selected, 1);
         }
+    }
+
+    #[test]
+    fn branch_diff_view_lists_files_and_opens_diff() {
+        let dir = std::env::temp_dir().join(format!("srev_bview_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-qm", "init"]);
+        run_git(&dir, &["checkout", "-q", "-b", "feature"]);
+        // 横スクロール検証のため、2 行目を幅を超える長い行にする。
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn a() {}\nfn B() { let _ = \"a deliberately long line to exercise horizontal scrolling\"; }\n",
+        )
+        .unwrap();
+        run_git(&dir, &["commit", "-qam", "edit a"]);
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        app.dispatch(Action::ToggleBranchDiff);
+        assert_eq!(app.view_mode, ViewMode::Branch);
+        assert!(!app.branch_files.is_empty(), "feature branch should have a PR diff");
+        assert!(
+            app.open.as_ref().expect("a file is opened").diff.is_some(),
+            "opened branch file should have a diff"
+        );
+
+        // 左上ペインは PR ファイル一覧（タイトルに基準ブランチ名）。
+        let (title, rows) = match app.left_pane(100) {
+            LeftPane::List { title, rows, .. } => (title, rows),
+            _ => panic!("branch view should show a file list"),
+        };
+        assert!(title.contains("PR vs main"), "{title}");
+        assert!(!rows.is_empty());
+
+        // 描画してパニックしないこと（オーバービュー・バーを含む）。
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // 横スクロール: content にフォーカスして l で進み、0 で戻る。
+        app.focus = Focus::Content;
+        app.content_action(Action::Right);
+        assert!(app.open.as_ref().unwrap().diff_hscroll > 0, "h-scroll should advance");
+        // `$`（行末送り）は末尾付近まで送るが、最低表示桁を残し本文を空にしない。
+        app.content_action(Action::LineEnd);
+        let longest = app
+            .open
+            .as_ref()
+            .unwrap()
+            .raw_lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap();
+        let h = app.open.as_ref().unwrap().diff_hscroll;
+        assert!(h > 0 && h < longest, "$ keeps some columns visible: h={h} longest={longest}");
+        app.content_action(Action::LineStart);
+        assert_eq!(app.open.as_ref().unwrap().diff_hscroll, 0);
+
+        // `C` をもう一度でコードモードへ戻る。
+        app.dispatch(Action::ToggleBranchDiff);
+        assert_eq!(app.view_mode, ViewMode::Code);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_file_by_path_exits_branch_view_even_when_dirty() {
+        // ^P/finder 相当でパス指定オープンしたら、開いたファイルに作業ツリー差分が
+        // あっても PR ビューに留まらず Code へ抜ける（差分の有無で挙動が割れない）。
+        let dir = std::env::temp_dir().join(format!("srev_bexit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("other.rs"), "fn o() {}\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-qm", "init"]);
+        run_git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        run_git(&dir, &["commit", "-qam", "edit a"]);
+        // other.rs を未コミットで変更（作業ツリー差分あり）。
+        std::fs::write(dir.join("other.rs"), "fn o() {}\nfn dirty() {}\n").unwrap();
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        app.dispatch(Action::ToggleBranchDiff);
+        assert_eq!(app.view_mode, ViewMode::Branch);
+
+        // PR 一覧に無い other.rs をパス指定で開く（差分ありでも Code へ抜ける）。
+        app.open_file(&dir.join("other.rs"));
+        assert_eq!(app.view_mode, ViewMode::Code, "path-open must leave the PR view");
+        assert!(
+            app.open.as_ref().unwrap().diff.is_some(),
+            "other.rs has a working-tree diff (so the old code would have stayed in Branch)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_outline_jump_loads_working_tree_file() {
+        // PR ビューのアウトラインからシンボルへ飛ぶと Code へ移り、表示は HEAD blob では
+        // なくディスクの実ファイル内容になる。
+        let dir = std::env::temp_dir().join(format!("srev_bout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-qm", "init"]);
+        run_git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        run_git(&dir, &["commit", "-qam", "edit a"]);
+        // 作業ツリーだけ HEAD と差をつける（実ファイルにのみ存在する関数）。
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\nfn working_only() {}\n").unwrap();
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        app.dispatch(Action::ToggleBranchDiff);
+        assert_eq!(app.view_mode, ViewMode::Branch);
+        // 開いているのは HEAD blob（working_only を含まない）。
+        let open = app.open.as_ref().expect("a.rs opened");
+        assert!(!open.outline.is_empty(), "HEAD blob should yield a symbol outline");
+        assert!(
+            !open.raw_lines.iter().any(|l| l.contains("working_only")),
+            "branch view shows the HEAD blob, not the working tree"
+        );
+
+        // アウトラインにフォーカスして最後のシンボルへ移動し、Enter で飛ぶ。
+        app.focus = Focus::Outline;
+        let last = app.open.as_ref().unwrap().outline.len() - 1;
+        app.open.as_mut().unwrap().outline_selected = last;
+        app.dispatch(Action::Activate);
+
+        assert_eq!(app.view_mode, ViewMode::Code, "outline jump lands in code view");
+        assert!(
+            app.open.as_ref().unwrap().raw_lines.iter().any(|l| l.contains("working_only")),
+            "code view must show the on-disk file, not the stale HEAD blob"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goto_change_moves_cursor_in_code_view() {
+        let dir = std::env::temp_dir().join(format!("srev_gchg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("code.rs"), "a\nb\nc\nd\ne\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-qm", "first"]);
+        // 4 行目(index 3)だけ変更。
+        std::fs::write(dir.join("code.rs"), "a\nb\nc\nD\ne\n").unwrap();
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        app.open_file(&dir.join("code.rs"));
+        // 差分はあるがトグルしていないので通常のコードビュー。
+        assert_eq!(app.view_mode, ViewMode::Code);
+        app.open.as_mut().unwrap().cursor_line = 0;
+        // } で変更行（index 3）へ飛ぶ。
+        app.dispatch(Action::NextChange);
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 3, "jumped to changed line");
+        // それ以上先に変更は無い（末尾でクランプ）。
+        app.dispatch(Action::NextChange);
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 3);
+        // { で前方向（先頭側）には変更が無い。
+        app.dispatch(Action::PrevChange);
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 3, "no earlier change");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_keys_jump_changes_in_code_view_when_not_searching() {
+        let dir = std::env::temp_dir().join(format!("srev_nchg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("code.rs"), "a\nb\nc\nd\ne\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-qm", "first"]);
+        // 4 行目(index 3)だけ変更。
+        std::fs::write(dir.join("code.rs"), "a\nb\nc\nD\ne\n").unwrap();
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        app.open_file(&dir.join("code.rs"));
+        assert_eq!(app.view_mode, ViewMode::Code);
+        app.focus = Focus::Content;
+        app.open.as_mut().unwrap().cursor_line = 0;
+
+        // 検索クエリが無いので n は変更ブロックジャンプ（} と同じ）。
+        assert!(app.search_query.is_empty());
+        app.dispatch(Action::SearchNext);
+        assert_eq!(app.open.as_ref().unwrap().cursor_line, 3, "n jumps to the change");
+
+        // 検索クエリがある場合は従来どおり検索移動（変更ジャンプにしない）。
+        app.open.as_mut().unwrap().cursor_line = 0;
+        app.search_query = "a".into(); // 1 行目 "a" にマッチ
+        app.dispatch(Action::SearchNext);
+        assert_eq!(
+            app.open.as_ref().unwrap().cursor_line,
+            0,
+            "with a query, n searches (only 'a' is on line 0) and does not change-jump"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

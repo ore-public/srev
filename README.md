@@ -23,11 +23,12 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Inline fuzzy filtering** with `/` in tree, outline, and overlay panels
 - **`Ctrl-R` reload** — re-reads the open file, git state, tree, and index while keeping cursor position
 - **Syntax highlighting** for 200+ languages via syntect (incl. PHP, HAML, TOML, TypeScript…) — **Markdown also highlights code inside fenced blocks** per language
-- **Diff review navigation** — jump between hunks with `n`/`N`, between changed files with `]`/`[`. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
+- **Diff review navigation** — jump between change blocks with `n`/`N` or `}`/`{`, between changed files with `]`/`[`, and scroll long lines horizontally with `h`/`l` (`0`/`$` for start / far right). A **change overview bar** on the right edge maps where the edits are and highlights your current viewport. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
 - **Commit view** (`c`) — the left pane lists commits that differ from the default branch (`default..HEAD`), or the full log when you're on the default branch. Pick a commit to see its changed files (bottom-left) and the selected file's side-by-side diff
+- **PR diff view** (`C`) — review the whole branch as one changeset: the left pane lists every file that differs from the default branch (three-dot `merge-base(default, HEAD)..HEAD`, so commits that landed on the default branch after you branched are excluded), and the right shows each file's full-context diff. `}`/`{` and `n`/`N` step through the changes
 - **Branch switching** (`Ctrl-V`) — fetches `origin` first, then shows local and remote branches with **type-to-filter** fuzzy search; selecting one checks it out (via `git`, auto-creating a tracking branch for remotes) and reloads automatically. The **current branch** is always shown as a chip at the bottom-right of the status bar
 - File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked). Dotfiles and `.gitignore`d files are listed too, shown **dimmed**; ignored directories (e.g. `target/`) appear but aren't descended into, and the `.git` directory is excluded
-- **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD
+- **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD; jump between change blocks with `}`/`{` (or `n`/`N` when no search is active), and a matching overview bar marks them on the right edge
 - Single binary. Builds on Linux / macOS / Windows
 
 ---
@@ -106,6 +107,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `Tab` | Cycle focus (tree → outline → content) |
 | `d` | Toggle diff ⇄ code (line position preserved) |
 | `c` | Toggle the commit view (commits vs the default branch, or full log) |
+| `C` | Toggle the PR diff view (all files changed vs the default branch, three-dot diff) |
 | `Ctrl-V` | Switch branch (fetches `origin` first, then pick a branch to check out) |
 | `Ctrl-P` | Open fuzzy file search overlay |
 | `Ctrl-F` | Project-wide content search (substring); `Enter` jumps to the matching line |
@@ -147,7 +149,8 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `Y` | Copy location to clipboard (no selection = `path:line:col`; single-line = `path:line`; multi-line = `path:start-end`) |
 | `Esc` | Cancel selection |
 | `/` → type → `Enter` | In-file search |
-| `n` / `N` | Next / previous match |
+| `n` / `N` | Next / previous search match; with no active search, jump to next / previous change block |
+| `}` / `{` | Jump to next / previous change block (vs HEAD) |
 
 > The `g` prefix for `gg`, `gd` and `gr` is fixed and cannot be remapped in the config file.
 
@@ -156,9 +159,10 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Scroll |
+| `h` / `l`, `0` / `$` | Scroll horizontally for long lines (`0` = start, `$` = far right) |
 | `gg` / `G` | Jump to start / end |
 | `PageDown` / `PageUp` | Page scroll |
-| `n` / `N` | Jump to next / previous hunk (change block) |
+| `n` / `N`, `}` / `{` | Jump to next / previous change block |
 | `s` | Toggle side-by-side ⇄ unified (default is side-by-side; new/deleted files show as single column) |
 
 #### Overlay / filter / search input
@@ -240,6 +244,9 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `jump_forward` | Jump history: go forward |
 | `toggle_jumps` | Toggle the jump-history pane |
 | `toggle_commits` | Toggle the commit view |
+| `toggle_branch_diff` | Toggle the PR diff view (vs the default branch) |
+| `next_change` | Jump to the next change block |
+| `prev_change` | Jump to the previous change block |
 | `switch_branch` | Open the branch picker (fetch + checkout) |
 
 Use `"none"` to disable a key binding.
