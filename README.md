@@ -21,7 +21,8 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Fuzzy file search** (`Ctrl-P`, powered by nucleo — fzf equivalent)
 - **Project-wide content search** (`Ctrl-F`, case-insensitive substring) — jump to a matching line
 - **Inline fuzzy filtering** with `/` in tree, outline, and overlay panels
-- **`Ctrl-R` reload** — re-reads the open file, git state, tree, and index while keeping cursor position
+- **`Ctrl-R` pull + reload** — pulls the current branch from `origin` (its same-named remote branch) and re-reads the open file, git state, tree, and index while keeping cursor position. Falls back to a plain local reload when there's no upstream / you're offline; conflicts abort cleanly
+- **Merge picker** (`m`) — fetches `origin`, then pick any branch (local or remote) with type-to-filter fuzzy search to merge into the current branch. On conflict the merge is aborted automatically and you're told to resolve it in your editor (srev has no editing)
 - **Syntax highlighting** for 200+ languages via syntect (incl. PHP, HAML, TOML, TypeScript…) — **Markdown also highlights code inside fenced blocks** per language
 - **Diff review navigation** — jump between change blocks with `n`/`N` or `}`/`{`, between changed files with `]`/`[`, and scroll long lines horizontally with `h`/`l` (`0`/`$` for start / far right). A **change overview bar** on the right edge maps where the edits are and highlights your current viewport. Diffs default to **side-by-side** (new/deleted files fall back to single column automatically); toggle with `s`
 - **Commit view** (`c`) — the left pane lists commits that differ from the default branch (`default..HEAD`), or the full log when you're on the default branch. Pick a commit to see its changed files (bottom-left) and the selected file's side-by-side diff
@@ -109,9 +110,10 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `c` | Toggle the commit view (commits vs the default branch, or full log) |
 | `C` | Toggle the PR diff view (all files changed vs the default branch, three-dot diff) |
 | `Ctrl-V` | Switch branch (fetches `origin` first, then pick a branch to check out) |
+| `m` | Merge picker — fetches `origin`, then pick a branch (local or remote) to merge into the current branch |
 | `Ctrl-P` | Open fuzzy file search overlay |
 | `Ctrl-F` | Project-wide content search (substring); `Enter` jumps to the matching line |
-| `Ctrl-R` | Reload (file, git state, tree, index — cursor kept) |
+| `Ctrl-R` | Pull the current branch from `origin` (same-named branch), then reload. Falls back to a plain local reload when there's no upstream or you're offline; on conflict the merge is aborted |
 | `]` / `[` | Open next / previous file (code mode = all files by path; diff mode = changed files) |
 | `(` / `)` | Jump history: go back / forward through jumps (`Ctrl-O` also goes back) |
 | `J` | Toggle the right-side jump-history pane (shown by default) |
@@ -248,6 +250,7 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `next_change` | Jump to the next change block |
 | `prev_change` | Jump to the previous change block |
 | `switch_branch` | Open the branch picker (fetch + checkout) |
+| `merge_branch` | Open the merge picker (fetch + merge a branch into the current one) |
 
 Use `"none"` to disable a key binding.
 The `g` prefix for `gg` / `gd` cannot be remapped.

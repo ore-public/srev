@@ -72,6 +72,8 @@ pub enum Action {
     PrevChange,
     /// ブランチ切替ピッカーを開く（origin fetch → 一覧 → 選択で checkout）。
     SwitchBranch,
+    /// merge ピッカーを開く（origin fetch → 一覧 → 選択ブランチを現在ブランチへ merge）。
+    MergeBranch,
 }
 
 impl Action {
@@ -117,6 +119,7 @@ impl Action {
             "next_change" | "change_next" => Self::NextChange,
             "prev_change" | "change_prev" => Self::PrevChange,
             "switch_branch" | "branch" | "branches" => Self::SwitchBranch,
+            "merge_branch" | "merge" => Self::MergeBranch,
             _ => return None,
         })
     }
@@ -267,6 +270,7 @@ impl Keymap {
         add(ch('}'), NextChange);
         add(ch('{'), PrevChange);
         add(ctrl('v'), SwitchBranch); // ブランチ切替（origin fetch → 一覧 → checkout）
+        add(ch('m'), MergeBranch); // merge ピッカー（origin fetch → 一覧 → 現在ブランチへ merge）
 
         Self { map }
     }

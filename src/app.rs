@@ -10,7 +10,7 @@ use ratatui::text::Line;
 use crate::diffview::{self, DiffRender};
 use crate::finder::{Finder, collect_files};
 use crate::fuzzy::Fuzzy;
-use crate::git::{BranchEntry, CommitFile, CommitInfo, FileStatus, GitInfo};
+use crate::git::{BranchEntry, CommitFile, CommitInfo, FileStatus, GitInfo, MergeOutcome, PullOutcome};
 use crate::grep::ProjectSearch;
 use crate::highlight::CodeHighlighter;
 use crate::keymap::{Action, Chord, Keymap};
@@ -125,6 +125,15 @@ impl RefList {
 }
 
 /// ブランチ切替ピッカーのオーバーレイ状態（`Ctrl-V`）。あいまい絞り込み対応。
+/// ブランチピッカーの用途。Enter の動作とタイトルを切り替える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerMode {
+    /// 選択ブランチへ checkout（`Ctrl-V`）。
+    Switch,
+    /// 選択ブランチを現在ブランチへ merge（`m`）。
+    Merge,
+}
+
 pub struct BranchList {
     /// 全ブランチ（fetch 時のスナップショット）。
     pub entries: Vec<BranchEntry>,
@@ -134,6 +143,10 @@ pub struct BranchList {
     pub results: Vec<usize>,
     /// `results` 内の選択位置。
     pub selected: usize,
+    /// ピッカーの用途（switch / merge）。
+    pub mode: PickerMode,
+    /// merge モードでのタイトル用：取り込み先（現在）ブランチ名。
+    pub into: String,
 }
 
 impl BranchList {
@@ -146,6 +159,8 @@ impl BranchList {
             query: String::new(),
             results,
             selected,
+            mode: PickerMode::Switch,
+            into: String::new(),
         }
     }
 
@@ -603,7 +618,8 @@ impl App {
             NextChange => self.change_jump(true),
             PrevChange => self.change_jump(false),
             SwitchBranch => self.open_branch_list(),
-            Reload => self.reload(),
+            MergeBranch => self.open_merge_list(),
+            Reload => self.pull_and_reload(),
             // 差分モードでは変更ファイル一覧、コードモードでは全ファイルを順送り。
             NextFile => self.navigate_files(self.nav_list(), true),
             PrevFile => self.navigate_files(self.nav_list(), false),
@@ -1729,6 +1745,34 @@ impl App {
         }
     }
 
+    /// merge ピッカーを開く（`m`）。fetch → 一覧 → Enter で選択ブランチを現在ブランチへ merge。
+    fn open_merge_list(&mut self) {
+        let Some(git) = self.git.as_ref() else {
+            self.flash = Some("not a git repository".into());
+            return;
+        };
+        let into = git.current_branch().unwrap_or_else(|| "HEAD".into());
+        // fetch して最新の remote ブランチを取り込めるようにする（失敗しても続行）。
+        let fetched = git.fetch_origin();
+        let entries = git.branches();
+        if entries.is_empty() {
+            self.flash = Some("no branches".into());
+            return;
+        }
+        let mut list = BranchList::new(entries);
+        list.mode = PickerMode::Merge;
+        list.into = into;
+        // merge では現在ブランチ自身は対象外。既定選択を最初の「現在以外」に寄せ、
+        // 開いてすぐ Enter しても弾かれないようにする。
+        if let Some(pos) = list.results.iter().position(|&i| !list.entries[i].is_head) {
+            list.selected = pos;
+        }
+        self.branches = Some(list);
+        if !fetched {
+            self.flash = Some("origin fetch failed (showing local)".into());
+        }
+    }
+
     /// クエリでブランチ一覧を絞り込み直す（選択は先頭へ）。
     fn recompute_branch_filter(&mut self) {
         let results = {
@@ -1749,24 +1793,56 @@ impl App {
         match key.code {
             KeyCode::Esc => self.branches = None,
             KeyCode::Enter => {
-                let target = self
-                    .branches
-                    .as_ref()
-                    .and_then(|b| b.current())
-                    .map(|e| (e.target.clone(), e.is_head));
+                let sel = self.branches.as_ref().and_then(|b| {
+                    b.current()
+                        .map(|e| (b.mode, e.display.clone(), e.target.clone(), e.is_head))
+                });
                 self.branches = None;
-                if let Some((target, is_head)) = target {
-                    if is_head {
-                        self.flash = Some(format!("already on {target}"));
-                        return;
-                    }
-                    match self.git.as_ref().map(|g| g.checkout(&target)) {
-                        Some(Ok(())) => {
-                            self.reload(); // checkout 後は自動でリロード
-                            self.flash = Some(format!("switched to {target}"));
+                let Some((mode, display, target, is_head)) = sel else {
+                    return;
+                };
+                match mode {
+                    PickerMode::Switch => {
+                        if is_head {
+                            self.flash = Some(format!("already on {target}"));
+                            return;
                         }
-                        Some(Err(e)) => self.flash = Some(format!("checkout failed: {e}")),
-                        None => {}
+                        match self.git.as_ref().map(|g| g.checkout(&target)) {
+                            Some(Ok(())) => {
+                                self.reload(); // checkout 後は自動でリロード
+                                self.flash = Some(format!("switched to {target}"));
+                            }
+                            Some(Err(e)) => self.flash = Some(format!("checkout failed: {e}")),
+                            None => {}
+                        }
+                    }
+                    PickerMode::Merge => {
+                        if is_head {
+                            self.flash = Some("cannot merge the current branch".into());
+                            return;
+                        }
+                        // merge ref は display（remote=origin/feature, local=feature の両対応）。
+                        match self.git.as_ref().map(|g| g.merge(&display)) {
+                            Some(MergeOutcome::Merged) => {
+                                self.reload();
+                                self.flash = Some(format!("merged {display}"));
+                            }
+                            Some(MergeOutcome::UpToDate) => {
+                                self.flash = Some(format!("already up to date with {display}"));
+                            }
+                            Some(MergeOutcome::Conflict) => {
+                                self.reload(); // abort 済み。状態を作り直す。
+                                self.flash =
+                                    Some(format!("merge conflict — aborted ({display})"));
+                            }
+                            Some(MergeOutcome::Failed(e)) => {
+                                self.flash = Some(format!(
+                                    "merge failed: {}",
+                                    e.lines().next().unwrap_or(&e)
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -2165,6 +2241,25 @@ impl App {
     }
 
     /// AI 編集後などに、ファイル内容・git 状態・ツリー・索引を読み直す。
+    /// `Ctrl-R`：origin の同名ブランチを pull してから全体を reload する。
+    /// upstream 無し/detached は pull せずローカル reload にフォールバック（中立メッセージ）。
+    fn pull_and_reload(&mut self) {
+        let outcome = self.git.as_ref().map(|g| g.pull_current());
+        self.reload(); // 先に状態を作り直す（内部で flash="reloaded" になる）
+        // reload の後に flash を上書きして pull 結果を知らせる。
+        if let Some(outcome) = outcome {
+            self.flash = Some(match outcome {
+                PullOutcome::Pulled => "pulled latest from origin".into(),
+                PullOutcome::UpToDate => "already up to date".into(),
+                PullOutcome::Conflict => "pull conflict — aborted (resolve manually)".into(),
+                PullOutcome::NoUpstream => "reloaded".into(),
+                PullOutcome::Failed(e) => {
+                    format!("pull failed: {}", e.lines().next().unwrap_or(&e))
+                }
+            });
+        }
+    }
+
     fn reload(&mut self) {
         self.statuses = self.git.as_ref().map(|g| g.statuses()).unwrap_or_default();
         self.branch = self.git.as_ref().and_then(|g| g.current_branch());
@@ -3462,5 +3557,37 @@ fn c() {}
             }
             _ => panic!("expected changed list in diff mode"),
         }
+    }
+
+    #[test]
+    fn merge_picker_opens_in_merge_mode() {
+        let dir = std::env::temp_dir().join(format!("srev_mpick_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_git(&dir, &["init", "-q", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "t@e.com"]);
+        run_git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        run_git(&dir, &["add", "."]);
+        run_git(&dir, &["commit", "-qm", "init"]);
+        run_git(&dir, &["branch", "feature"]); // merge 対象が一覧に出るように
+
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        // `m` で merge ピッカーが merge モードで開く（origin 無しでもローカル一覧で開く）。
+        app.dispatch(Action::MergeBranch);
+        let b = app.branches.as_ref().expect("merge picker should open");
+        assert_eq!(b.mode, PickerMode::Merge);
+        assert_eq!(b.into, "main", "merge into the current branch");
+        assert!(
+            b.entries.iter().any(|e| e.display == "feature"),
+            "other branches are listed as merge sources"
+        );
+        // 対して Ctrl-V（switch）は Switch モードで開く。
+        app.branches = None;
+        app.dispatch(Action::SwitchBranch);
+        assert_eq!(app.branches.as_ref().unwrap().mode, PickerMode::Switch);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

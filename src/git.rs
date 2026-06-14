@@ -79,6 +79,37 @@ pub struct BranchEntry {
     pub is_remote: bool,
 }
 
+/// `Ctrl-R`（origin の同名ブランチを pull）の結果。
+pub enum PullOutcome {
+    /// 既に最新（取り込むものが無い）。
+    UpToDate,
+    /// 取り込み成功（早送り or マージ）。
+    Pulled,
+    /// コンフリクトのため中止し、作業ツリーを復元した。
+    Conflict,
+    /// upstream 無し / detached / origin に同名が無い → 呼び出し側は通常 reload にフォールバック。
+    NoUpstream,
+    /// その他の失敗（オフライン・作業ツリー汚れ等）。stderr を保持。
+    Failed(String),
+}
+
+/// 任意ブランチを現在ブランチへ merge した結果。
+pub enum MergeOutcome {
+    UpToDate,
+    Merged,
+    /// コンフリクトのため中止し、作業ツリーを復元した。
+    Conflict,
+    Failed(String),
+}
+
+/// `git merge` / `git pull`（＝fetch+merge）の共通実行結果。
+enum MergeRun {
+    UpToDate,
+    Done,
+    Conflict,
+    Failed(String),
+}
+
 /// コミット一覧の取得結果。
 pub struct CommitLog {
     pub commits: Vec<CommitInfo>,
@@ -475,6 +506,73 @@ impl GitInfo {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    /// `Ctrl-R`：origin の同名ブランチを pull（通常 merge）する。upstream が無い等で
+    /// 取り込めない場合は `NoUpstream` を返し、呼び出し側がローカル reload にフォールバックする。
+    pub fn pull_current(&self) -> PullOutcome {
+        let Some(branch) = self.current_branch() else {
+            return PullOutcome::NoUpstream; // detached HEAD 等
+        };
+        // origin に同名ブランチが無ければ pull しない（ローカルだけのブランチ等）。
+        if self
+            .repo
+            .revparse_single(&format!("origin/{branch}"))
+            .is_err()
+        {
+            return PullOutcome::NoUpstream;
+        }
+        match self.run_merge_like(&["pull", "origin", &branch]) {
+            MergeRun::UpToDate => PullOutcome::UpToDate,
+            MergeRun::Done => PullOutcome::Pulled,
+            MergeRun::Conflict => PullOutcome::Conflict,
+            MergeRun::Failed(e) => PullOutcome::Failed(e),
+        }
+    }
+
+    /// 任意の ref（`origin/feature` / `feature`）を現在ブランチへ merge する（git CLI 委譲）。
+    pub fn merge(&self, refname: &str) -> MergeOutcome {
+        match self.run_merge_like(&["merge", refname]) {
+            MergeRun::UpToDate => MergeOutcome::UpToDate,
+            MergeRun::Done => MergeOutcome::Merged,
+            MergeRun::Conflict => MergeOutcome::Conflict,
+            MergeRun::Failed(e) => MergeOutcome::Failed(e),
+        }
+    }
+
+    /// `git merge` / `git pull` を実行し結果を判定する。コンフリクト検出時は
+    /// `git merge --abort` で merge 前の状態へ戻す（srev は編集機能を持たないため）。
+    fn run_merge_like(&self, args: &[&str]) -> MergeRun {
+        let out = match Command::new("git")
+            .arg("-C")
+            .arg(&self.workdir)
+            .args(args)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => return MergeRun::Failed(e.to_string()),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() {
+            if stdout.contains("Already up to date") {
+                return MergeRun::UpToDate;
+            }
+            return MergeRun::Done;
+        }
+        let conflicted = stdout.contains("CONFLICT")
+            || stderr.contains("CONFLICT")
+            || stdout.contains("Automatic merge failed")
+            || stderr.contains("Automatic merge failed");
+        if conflicted {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&self.workdir)
+                .args(["merge", "--abort"])
+                .status();
+            return MergeRun::Conflict;
+        }
+        MergeRun::Failed(stderr.trim().to_string())
+    }
 }
 
 /// git2 の差分 Delta 種別を [`FileStatus`] へ。
@@ -694,6 +792,95 @@ mod tests {
         // checkout で実際に切り替わる。
         info.checkout("main").expect("checkout main");
         assert_eq!(info.current_branch().as_deref(), Some("main"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_current_brings_in_origin_commits() {
+        let base = std::env::temp_dir().join(format!("srev_pull_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let origin = base.join("origin.git");
+        let a = base.join("a");
+        let b = base.join("b");
+
+        // bare origin（既定ブランチ main）と、それを clone した 2 つの作業ツリー。
+        git(&base, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+        git(&base, &["clone", "-q", origin.to_str().unwrap(), "a"]);
+        git(&a, &["config", "user.email", "t@e.com"]);
+        git(&a, &["config", "user.name", "t"]);
+        std::fs::write(a.join("f.txt"), "one\n").unwrap();
+        git(&a, &["add", "."]);
+        git(&a, &["commit", "-qm", "init"]);
+        git(&a, &["push", "-q", "origin", "main"]);
+
+        git(&base, &["clone", "-q", origin.to_str().unwrap(), "b"]);
+        git(&b, &["config", "user.email", "t@e.com"]);
+        git(&b, &["config", "user.name", "t"]);
+
+        // a 側が origin/main を進める。
+        std::fs::write(a.join("f.txt"), "one\ntwo\n").unwrap();
+        git(&a, &["commit", "-qam", "advance"]);
+        git(&a, &["push", "-q", "origin", "main"]);
+
+        // b は古い内容。pull_current で取り込む。
+        let info = GitInfo::discover(&b).expect("repo b");
+        assert_eq!(info.current_branch().as_deref(), Some("main"));
+        assert!(matches!(info.pull_current(), PullOutcome::Pulled));
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\ntwo\n");
+        // もう一度 pull すると最新（取り込むものが無い）。
+        assert!(matches!(info.pull_current(), PullOutcome::UpToDate));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_brings_in_branch_and_aborts_on_conflict() {
+        let dir = std::env::temp_dir().join(format!("srev_merge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@e.com"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "base\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        // feature: b.txt のみ変更（main と非衝突）。
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("b.txt"), "from-feature\n").unwrap();
+        git(&dir, &["commit", "-qam", "edit b"]);
+
+        // main: a.txt を変更（feature と非衝突）。feature を merge できる。
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("a.txt"), "from-main\n").unwrap();
+        git(&dir, &["commit", "-qam", "edit a"]);
+
+        let info = GitInfo::discover(&dir).expect("repo");
+        assert!(matches!(info.merge("feature"), MergeOutcome::Merged));
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "from-feature\n");
+
+        // 衝突を作る: merge 後の main から分岐し、双方が同じ行(b.txt)を別内容に変更。
+        git(&dir, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(dir.join("b.txt"), "other-change\n").unwrap();
+        git(&dir, &["commit", "-qam", "other edits b"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("b.txt"), "main-change\n").unwrap();
+        git(&dir, &["commit", "-qam", "main edits b"]);
+
+        assert!(matches!(info.merge("other"), MergeOutcome::Conflict));
+        // abort 済み：作業ツリーは merge 前（main の b.txt）に戻り、MERGE_HEAD は無い。
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "main-change\n");
+        assert!(
+            GitInfo::discover(&dir)
+                .unwrap()
+                .repo
+                .revparse_single("MERGE_HEAD")
+                .is_err(),
+            "merge は中止され MERGE_HEAD は残らない"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

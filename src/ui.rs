@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::app::{
-    App, BranchList, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, RefList,
-    SelRegion, ViewMode,
+    App, BranchList, Focus, LeftPane, ListRow, OpenFile, OutlinePane, OutlineRow, PickerMode,
+    RefList, SelRegion, ViewMode,
 };
 use crate::diffview::{LineMark, RowChange};
 use crate::finder::Finder;
@@ -606,7 +606,10 @@ fn render_overview_bar(
     }
     let view_start = scroll;
     let view_end = (scroll + viewport).min(total);
-    const VIEW_BG: Color = Color::Rgb(48, 52, 66);
+    // 現在表示範囲（スクロールバーのつまみ）の見せ方。変更が無い行でも実体のある
+    // 明るいブロックで描き、現在位置がはっきり見えるようにする。
+    const THUMB: Color = Color::Rgb(132, 144, 178); // つまみ（変更色と混ざらない明るい灰）
+    const VIEW_BG: Color = Color::Rgb(64, 70, 92); // 変更マーカーが表示範囲内であることの背景
 
     // 種別の強さ（範囲内で最も目立つ変更を採用）。
     let rank = |c: RowChange| match c {
@@ -632,6 +635,8 @@ fn render_overview_bar(
             RowChange::Add => ("█", Color::Green),
             RowChange::Del => ("█", Color::Red),
             RowChange::Mod => ("█", Color::Blue),
+            // 変更なし: 表示範囲内はつまみ（明るいブロック）、範囲外は空の溝。
+            RowChange::None if in_view => ("█", THUMB),
             RowChange::None => (" ", Color::DarkGray),
         };
         let mut style = Style::default().fg(fg);
@@ -715,7 +720,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("s", "split"),
             ("d", "code"),
             ("c", "exit commits"),
-            ("^R", "reload"),
+            ("^R", "pull/reload"),
         ]
     } else if app.view_mode == ViewMode::Branch {
         vec![
@@ -728,7 +733,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("s", "split"),
             ("d", "code"),
             ("C", "exit PR"),
-            ("^R", "reload"),
+            ("^R", "pull/reload"),
         ]
     } else if app.view_mode == ViewMode::Diff {
         vec![
@@ -743,7 +748,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("C", "PR diff"),
             ("^F", "Search Text"),
             ("/", find_word),
-            ("^R", "reload"),
+            ("^R", "pull/reload"),
         ]
     } else {
         vec![
@@ -763,9 +768,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ("c", "commits"),
             ("C", "PR diff"),
             ("^V", "branch"),
+            ("m", "merge"),
             ("v/V/y", "yank"),
             ("Y", "loc"),
-            ("^R", "reload"),
+            ("^R", "pull/reload"),
         ]
     };
     // 区切り線で項目を分け、キー（明）と説明（暗）を対比させる。
@@ -949,15 +955,29 @@ fn render_branches(frame: &mut Frame, area: Rect, branches: &BranchList) {
     let popup = centered_rect(area, 60, 70);
     frame.render_widget(Clear, popup);
 
-    let title = format!(
-        " Switch branch — {}/{} (type to filter, Enter: checkout) ",
-        branches.results.len(),
-        branches.entries.len()
-    );
+    let (title, border) = match branches.mode {
+        PickerMode::Merge => (
+            format!(
+                " Merge into {} — {}/{} (type to filter, Enter: merge) ",
+                branches.into,
+                branches.results.len(),
+                branches.entries.len()
+            ),
+            Color::Yellow,
+        ),
+        PickerMode::Switch => (
+            format!(
+                " Switch branch — {}/{} (type to filter, Enter: checkout) ",
+                branches.results.len(),
+                branches.entries.len()
+            ),
+            Color::Magenta,
+        ),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(Style::default().fg(border))
         .title(title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
