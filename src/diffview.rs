@@ -3,14 +3,20 @@
 //! 追加・文脈行はフルファイルのハイライト済み行を再利用して配色を一致させ、
 //! 削除行のみ単体でハイライトする。
 
+use std::ops::Range;
+
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::git::{DiffKind, DiffLine};
 use crate::highlight::{CodeHighlighter, Syntax};
 
-const ADD_BG: Color = Color::Rgb(22, 42, 28);
-const DEL_BG: Color = Color::Rgb(48, 26, 28);
+// 行全体の地色（変更行のうち「変わっていない文字」の背景）。
+const ADD_BG: Color = Color::Rgb(28, 58, 38);
+const DEL_BG: Color = Color::Rgb(64, 32, 36);
+// 行内で実際に変わった文字を強調する背景（地色より一段明るい）。
+const ADD_EMPH_BG: Color = Color::Rgb(46, 102, 58);
+const DEL_EMPH_BG: Color = Color::Rgb(120, 50, 56);
 
 pub struct DiffRender {
     /// 表示用の行（unified）。
@@ -178,52 +184,39 @@ pub fn build(
     let mut rows = Vec::with_capacity(diff.len());
     let mut to_code = Vec::with_capacity(diff.len());
     let mut row_changes = Vec::with_capacity(diff.len());
+    // 連続する削除/追加を溜め、文脈/見出し/末尾でまとめて流す（行内強調のため対にする）。
+    let mut pdel: Vec<&DiffLine> = Vec::new();
+    let mut padd: Vec<&DiffLine> = Vec::new();
 
     for dl in diff {
-        row_changes.push(match dl.kind {
-            DiffKind::Add => RowChange::Add,
-            DiffKind::Del => RowChange::Del,
-            DiffKind::Hunk | DiffKind::Context => RowChange::None,
-        });
         match dl.kind {
+            DiffKind::Del => pdel.push(dl),
+            DiffKind::Add => padd.push(dl),
             DiffKind::Hunk => {
-                rows.push(Line::styled(
-                    dl.content.clone(),
-                    Style::default().fg(Color::Cyan),
-                ));
+                flush_unified(
+                    &mut rows, &mut to_code, &mut row_changes, &mut pdel, &mut padd,
+                    code_lines, highlighter, syntax,
+                );
+                rows.push(Line::styled(dl.content.clone(), Style::default().fg(Color::Cyan)));
                 to_code.push(None);
+                row_changes.push(RowChange::None);
             }
-            DiffKind::Context | DiffKind::Add => {
-                let bg = (dl.kind == DiffKind::Add).then_some(ADD_BG);
-                let sign = if dl.kind == DiffKind::Add { '+' } else { ' ' };
+            DiffKind::Context => {
+                flush_unified(
+                    &mut rows, &mut to_code, &mut row_changes, &mut pdel, &mut padd,
+                    code_lines, highlighter, syntax,
+                );
                 let code_idx = dl.new_lineno.map(|n| (n as usize).saturating_sub(1));
-
-                let mut spans = vec![gutter(sign, dl.new_lineno, bg)];
-                if let Some(cl) = code_idx.and_then(|i| code_lines.get(i)) {
-                    for s in &cl.spans {
-                        let style = match bg {
-                            Some(bg) => s.style.bg(bg),
-                            None => s.style,
-                        };
-                        spans.push(Span::styled(s.content.clone(), style));
-                    }
-                }
-                rows.push(styled_line(spans, bg));
+                rows.push(side_line(dl.new_lineno, ' ', None, code_line_for(dl.new_lineno, code_lines)));
                 to_code.push(code_idx);
-            }
-            DiffKind::Del => {
-                let mut spans = vec![gutter('-', None, Some(DEL_BG))];
-                let hl = highlighter.highlight(syntax, &dl.content);
-                if let Some(first) = hl.first() {
-                    for s in &first.spans {
-                        spans.push(Span::styled(s.content.clone(), s.style.bg(DEL_BG)));
-                    }
-                }
-                rows.push(styled_line(spans, Some(DEL_BG)));
-                to_code.push(None);
+                row_changes.push(RowChange::None);
             }
         }
     }
+    flush_unified(
+        &mut rows, &mut to_code, &mut row_changes, &mut pdel, &mut padd,
+        code_lines, highlighter, syntax,
+    );
 
     let change_anchors = anchors_from(&row_changes);
     DiffRender {
@@ -238,6 +231,113 @@ pub fn build(
         raw: diff.to_vec(),
         syntax,
     }
+}
+
+/// 溜まった削除/追加を unified の行へ流す。削除→追加の順に出し、対になる行は
+/// 行内で実際に変わった文字だけを強調する（共通接頭辞/接尾辞を除いた範囲）。
+#[allow(clippy::too_many_arguments)]
+fn flush_unified(
+    rows: &mut Vec<Line<'static>>,
+    to_code: &mut Vec<Option<usize>>,
+    row_changes: &mut Vec<RowChange>,
+    pdel: &mut Vec<&DiffLine>,
+    padd: &mut Vec<&DiffLine>,
+    code_lines: &[Line<'static>],
+    highlighter: &mut CodeHighlighter,
+    syntax: Syntax,
+) {
+    // 対になる削除/追加行は変わった文字範囲を一度だけ求め、両側で使い回す。
+    // 対応行が無い行は range が空になり、行内強調なし（地色のみ）で描画される。
+    let ranges = paired_ranges(pdel, padd);
+
+    for (i, dl) in pdel.iter().enumerate() {
+        let hl = highlighter.highlight(syntax, &dl.content);
+        let body = hl.first().map(|l| l.spans.as_slice()).unwrap_or(&[]);
+        rows.push(change_row('-', dl.old_lineno, DEL_BG, DEL_EMPH_BG, body, &ranges[i].0));
+        to_code.push(None);
+        row_changes.push(RowChange::Del);
+    }
+    for (i, dl) in padd.iter().enumerate() {
+        let code_idx = dl.new_lineno.map(|n| (n as usize).saturating_sub(1));
+        let body: Vec<Span<'static>> = code_line_for(dl.new_lineno, code_lines)
+            .map(|l| l.spans.clone())
+            .unwrap_or_default();
+        rows.push(change_row('+', dl.new_lineno, ADD_BG, ADD_EMPH_BG, &body, &ranges[i].1));
+        to_code.push(code_idx);
+        row_changes.push(RowChange::Add);
+    }
+    pdel.clear();
+    padd.clear();
+}
+
+/// 2 行の「変わった文字」の char 範囲を、共通接頭辞/接尾辞を除いて求める。
+/// 返り値 `(old 側, new 側)`。完全一致なら両方 `pre..pre`（空）。
+fn changed_ranges(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
+    let o: Vec<char> = old.chars().collect();
+    let n: Vec<char> = new.chars().collect();
+    let mut pre = 0;
+    while pre < o.len() && pre < n.len() && o[pre] == n[pre] {
+        pre += 1;
+    }
+    let mut suf = 0;
+    while suf < o.len() - pre && suf < n.len() - pre && o[o.len() - 1 - suf] == n[n.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    (pre..o.len() - suf, pre..n.len() - suf)
+}
+
+/// 溜まった削除/追加を位置で対にし、各ペアの変更範囲 `(old 側, new 側)` を求める。
+/// 長さは `max(pdel, padd)`。片側しか無い行は空範囲（行内強調なし）。
+fn paired_ranges(pdel: &[&DiffLine], padd: &[&DiffLine]) -> Vec<(Range<usize>, Range<usize>)> {
+    (0..pdel.len().max(padd.len()))
+        .map(|i| match (pdel.get(i), padd.get(i)) {
+            (Some(d), Some(a)) => changed_ranges(&d.content, &a.content),
+            _ => (0..0, 0..0),
+        })
+        .collect()
+}
+
+/// 変更行（add/del）1 行ぶんを組み立てる。gutter + 行内強調済み本文。
+fn change_row(
+    sign: char,
+    lineno: Option<u32>,
+    base_bg: Color,
+    emph_bg: Color,
+    body: &[Span<'static>],
+    range: &Range<usize>,
+) -> Line<'static> {
+    let mut spans = vec![gutter(sign, lineno, Some(base_bg))];
+    spans.extend(emphasized(body, base_bg, emph_bg, range));
+    styled_line(spans, Some(base_bg))
+}
+
+/// ハイライト済み spans に背景を付ける。`range`（char 単位）内は強調 bg、その他は地色 bg。
+/// 文字境界で span を分割するので、シンタックスの前景色は維持される。
+fn emphasized(
+    src: &[Span<'static>],
+    base_bg: Color,
+    emph_bg: Color,
+    range: &Range<usize>,
+) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut col = 0usize; // 行頭からの char index
+    for s in src {
+        let chars: Vec<char> = s.content.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let inside = range.contains(&(col + i));
+            let start = i;
+            while i < chars.len() && range.contains(&(col + i)) == inside {
+                i += 1;
+            }
+            let text: String = chars[start..i].iter().collect();
+            let bg = if inside { emph_bg } else { base_bg };
+            out.push(Span::styled(text, s.style.bg(bg)));
+        }
+        col += chars.len();
+    }
+    out
 }
 
 /// 新規ファイル（追加のみ）/ 削除ファイル（削除のみ）か。
@@ -305,22 +405,24 @@ fn drain_changes(
     highlighter: &mut CodeHighlighter,
     syntax: Syntax,
 ) {
-    let n = pdel.len().max(padd.len());
-    for i in 0..n {
+    // 左右が対になる行は変わった文字範囲を一度だけ求め、両側で強調する。
+    let ranges = paired_ranges(pdel, padd);
+    for (i, (del_range, add_range)) in ranges.iter().enumerate() {
         let left = match pdel.get(i) {
             Some(dl) => {
                 let hl = highlighter.highlight(syntax, &dl.content);
-                del_line(dl.old_lineno, hl.first())
+                let body = hl.first().map(|l| l.spans.as_slice()).unwrap_or(&[]);
+                change_row('-', dl.old_lineno, DEL_BG, DEL_EMPH_BG, body, del_range)
             }
             None => Line::from(""),
         };
         let right = match padd.get(i) {
-            Some(dl) => side_line(
-                dl.new_lineno,
-                '+',
-                Some(ADD_BG),
-                code_line_for(dl.new_lineno, code_lines),
-            ),
+            Some(dl) => {
+                let body: Vec<Span<'static>> = code_line_for(dl.new_lineno, code_lines)
+                    .map(|l| l.spans.clone())
+                    .unwrap_or_default();
+                change_row('+', dl.new_lineno, ADD_BG, ADD_EMPH_BG, &body, add_range)
+            }
             None => Line::from(""),
         };
         // 左右の埋まり方で種別を決める（両方=変更 / 右のみ=追加 / 左のみ=削除）。
@@ -357,17 +459,6 @@ fn side_line(
         }
     }
     styled_line(spans, bg)
-}
-
-/// 削除側 1 行（単体ハイライト）。
-fn del_line(lineno: Option<u32>, hl_first: Option<&Line<'static>>) -> Line<'static> {
-    let mut spans = vec![gutter('-', lineno, Some(DEL_BG))];
-    if let Some(first) = hl_first {
-        for s in &first.spans {
-            spans.push(Span::styled(s.content.clone(), s.style.bg(DEL_BG)));
-        }
-    }
-    styled_line(spans, Some(DEL_BG))
 }
 
 fn gutter(sign: char, lineno: Option<u32>, bg: Option<Color>) -> Span<'static> {
@@ -531,5 +622,67 @@ mod tests {
         );
         // 変更ブロックは 2 つ（index 1 と 3）。
         assert_eq!(r.change_anchors_for(false), &[1, 3]);
+    }
+
+    #[test]
+    fn changed_ranges_trims_common_prefix_and_suffix() {
+        // "let a = 1;" → "let a = 2;" は 9 文字目（index 8）だけ変わる。
+        assert_eq!(changed_ranges("let a = 1;", "let a = 2;"), (8..9, 8..9));
+        // 完全一致は空範囲。
+        assert_eq!(changed_ranges("same", "same"), (4..4, 4..4));
+        // 末尾追記は old 側が空、new 側だけ範囲を持つ。
+        assert_eq!(changed_ranges("foo", "foobar"), (3..3, 3..6));
+    }
+
+    #[test]
+    fn intraline_emphasis_marks_only_changed_chars() {
+        let mut h = CodeHighlighter::new();
+        let plain = h.plain();
+        // 追加側の新内容（new_lineno=1 → code_lines[0]）。
+        let code = vec![Line::from("let a = 2;")];
+        let diff = vec![
+            dl(DiffKind::Del, Some(1), None, "let a = 1;"),
+            dl(DiffKind::Add, None, Some(1), "let a = 2;"),
+        ];
+        let (split, _) = build_split(&diff, &code, &mut h, plain);
+        let row = &split[0];
+        // 変わった文字（"1"/"2"）だけが強調 bg、変わらない部分は地色 bg。
+        assert!(
+            row.right.spans.iter().any(|s| s.style.bg == Some(ADD_EMPH_BG)),
+            "changed char emphasized on add side"
+        );
+        assert!(
+            row.right.spans.iter().any(|s| s.style.bg == Some(ADD_BG)),
+            "unchanged part keeps the base bg"
+        );
+        assert!(
+            row.left.spans.iter().any(|s| s.style.bg == Some(DEL_EMPH_BG)),
+            "changed char emphasized on del side"
+        );
+        // 強調されるのは 1 文字分だけ（"2" の span がちょうど "2"）。
+        let emph: String = row
+            .right
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(ADD_EMPH_BG))
+            .map(|s| s.content.clone())
+            .collect();
+        assert_eq!(emph, "2");
+    }
+
+    #[test]
+    fn unified_emphasizes_changed_chars_for_paired_lines() {
+        let mut h = CodeHighlighter::new();
+        let plain = h.plain();
+        let code = vec![Line::from("value = 99;")];
+        let diff = vec![
+            dl(DiffKind::Del, Some(1), None, "value = 10;"),
+            dl(DiffKind::Add, None, Some(1), "value = 99;"),
+        ];
+        let r = build(&diff, &code, &mut h, plain);
+        // unified でも対になる行は強調 bg を持つ（del 行と add 行の両方）。
+        let any_bg = |line: &Line<'static>, c: Color| line.spans.iter().any(|s| s.style.bg == Some(c));
+        assert!(r.rows.iter().any(|l| any_bg(l, DEL_EMPH_BG)), "del line emphasized");
+        assert!(r.rows.iter().any(|l| any_bg(l, ADD_EMPH_BG)), "add line emphasized");
     }
 }
