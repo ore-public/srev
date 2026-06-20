@@ -200,6 +200,8 @@ impl GitInfo {
             .recurse_untracked_dirs(true)
             .show_untracked_content(true)
             .context_lines(FULL_FILE_CONTEXT)
+            // pathspec をグロブでなく完全一致にする（名前に *?[] を含むファイル対策）。
+            .disable_pathspec_match(true)
             .pathspec(rel.to_string_lossy().to_string());
 
         let diff = self
@@ -332,7 +334,9 @@ impl GitInfo {
         let tree = commit.tree().ok();
         let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
         let mut opts = DiffOptions::new();
-        opts.context_lines(FULL_FILE_CONTEXT).pathspec(rel);
+        opts.context_lines(FULL_FILE_CONTEXT)
+            .disable_pathspec_match(true)
+            .pathspec(rel);
         let Ok(diff) = self.repo.diff_tree_to_tree(
             parent_tree.as_ref(),
             tree.as_ref(),
@@ -420,7 +424,9 @@ impl GitInfo {
         let base_tree = self.repo.find_commit(base).ok().and_then(|c| c.tree().ok());
         let head_tree = self.repo.find_commit(head).ok().and_then(|c| c.tree().ok());
         let mut opts = DiffOptions::new();
-        opts.context_lines(FULL_FILE_CONTEXT).pathspec(rel);
+        opts.context_lines(FULL_FILE_CONTEXT)
+            .disable_pathspec_match(true)
+            .pathspec(rel);
         let Ok(diff) = self.repo.diff_tree_to_tree(
             base_tree.as_ref(),
             head_tree.as_ref(),
@@ -542,6 +548,8 @@ impl GitInfo {
     /// `git merge` / `git pull` を実行し結果を判定する。コンフリクト検出時は
     /// `git merge --abort` で merge 前の状態へ戻す（srev は編集機能を持たないため）。
     fn run_merge_like(&self, args: &[&str]) -> MergeRun {
+        // 実行前の HEAD を控える（成功時に「最新で変化なし」を出力文字列に頼らず判定する）。
+        let head_before = self.repo.head().ok().and_then(|h| h.target());
         let out = match Command::new("git")
             .arg("-C")
             .arg(&self.workdir)
@@ -551,19 +559,25 @@ impl GitInfo {
             Ok(o) => o,
             Err(e) => return MergeRun::Failed(e.to_string()),
         };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
         if out.status.success() {
-            if stdout.contains("Already up to date") {
-                return MergeRun::UpToDate;
-            }
-            return MergeRun::Done;
+            // 成功時は HEAD が動いたかで Done / UpToDate を分ける。
+            let head_after = self.repo.head().ok().and_then(|h| h.target());
+            return if head_after == head_before {
+                MergeRun::UpToDate
+            } else {
+                MergeRun::Done
+            };
         }
-        let conflicted = stdout.contains("CONFLICT")
-            || stderr.contains("CONFLICT")
-            || stdout.contains("Automatic merge failed")
-            || stderr.contains("Automatic merge failed");
+        // 失敗時はリポジトリの状態でコンフリクトを判定する（git 出力の翻訳に依存しない）。
+        // マージ進行中（MERGE_HEAD あり）か index に未解決があればコンフリクト扱い。
+        let conflicted = self.repo.state() == git2::RepositoryState::Merge
+            || self
+                .repo
+                .index()
+                .map(|mut i| i.read(true).is_ok() && i.has_conflicts())
+                .unwrap_or(false);
         if conflicted {
+            // srev は編集機能を持たないため、コンフリクトは取り込まず merge 前へ戻す。
             let _ = Command::new("git")
                 .arg("-C")
                 .arg(&self.workdir)
@@ -571,6 +585,7 @@ impl GitInfo {
                 .status();
             return MergeRun::Conflict;
         }
+        let stderr = String::from_utf8_lossy(&out.stderr);
         MergeRun::Failed(stderr.trim().to_string())
     }
 }
@@ -599,6 +614,31 @@ fn fmt_date(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn collect_diff_lines(diff: &Diff) -> Vec<DiffLine> {
+    let mut lines = Vec::new();
+    let _ = diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        let content = String::from_utf8_lossy(line.content())
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let kind = match line.origin() {
+            '+' => DiffKind::Add,
+            '-' => DiffKind::Del,
+            ' ' => DiffKind::Context,
+            'H' => DiffKind::Hunk,
+            // 'F'（ファイルヘッダ）など差分本文以外は捨てる
+            _ => return true,
+        };
+        lines.push(DiffLine {
+            kind,
+            old_lineno: line.old_lineno(),
+            new_lineno: line.new_lineno(),
+            content,
+        });
+        true
+    });
+    lines
 }
 
 #[cfg(test)]
@@ -884,29 +924,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-fn collect_diff_lines(diff: &Diff) -> Vec<DiffLine> {
-    let mut lines = Vec::new();
-    let _ = diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-        let content = String::from_utf8_lossy(line.content())
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
-        let kind = match line.origin() {
-            '+' => DiffKind::Add,
-            '-' => DiffKind::Del,
-            ' ' => DiffKind::Context,
-            'H' => DiffKind::Hunk,
-            // 'F'（ファイルヘッダ）など差分本文以外は捨てる
-            _ => return true,
-        };
-        lines.push(DiffLine {
-            kind,
-            old_lineno: line.old_lineno(),
-            new_lineno: line.new_lineno(),
-            content,
-        });
-        true
-    });
-    lines
 }

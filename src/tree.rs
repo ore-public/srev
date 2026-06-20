@@ -122,14 +122,14 @@ impl Tree {
 
     /// 選択ディレクトリを畳む。ファイル上なら親へ移動する感覚で何もしない。
     pub fn collapse(&mut self) {
-        if let Some(row) = self.rows.get(self.selected) {
-            if row.is_dir {
-                let indices = row.indices.clone();
-                if let Some(node) = node_at_mut(&mut self.root, &indices) {
-                    node.expanded = false;
-                }
-                self.rebuild_rows();
+        if let Some(row) = self.rows.get(self.selected)
+            && row.is_dir
+        {
+            let indices = row.indices.clone();
+            if let Some(node) = node_at_mut(&mut self.root, &indices) {
+                node.expanded = false;
             }
+            self.rebuild_rows();
         }
     }
 

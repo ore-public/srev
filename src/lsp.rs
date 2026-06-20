@@ -594,6 +594,8 @@ fn write_message(stdin: &mut impl Write, msg: &Value) -> std::io::Result<()> {
 
 /// 1 フレーム読む。EOF/不正なら `None`。
 fn read_message(reader: &mut impl BufRead) -> Option<Value> {
+    /// 1 フレームの上限。壊れた/悪意あるサーバーが巨大長を申告したときの一括確保を防ぐ。
+    const MAX_FRAME: usize = 64 * 1024 * 1024;
     let mut content_len: usize = 0;
     loop {
         let mut line = String::new();
@@ -607,6 +609,9 @@ fn read_message(reader: &mut impl BufRead) -> Option<Value> {
         if let Some(v) = line.strip_prefix("Content-Length:") {
             content_len = v.trim().parse().ok()?;
         }
+    }
+    if content_len == 0 || content_len > MAX_FRAME {
+        return None; // 長さ未指定/異常な巨大フレームは打ち切る。
     }
     let mut buf = vec![0u8; content_len];
     std::io::Read::read_exact(reader, &mut buf).ok()?;

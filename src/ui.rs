@@ -1036,8 +1036,9 @@ fn highlight_match(text: &str, needle_lower: &str) -> Vec<Span<'static>> {
     let lower = text.to_lowercase();
     let mut spans = Vec::new();
     let mut start = 0;
-    // バイト位置でスキャン（lower と text は同じ長さの ASCII 化を仮定せず、
-    // 小文字化で長さが変わりうるが、ここでは素朴に char 境界で扱う）。
+    // char 単位でスキャンする。小文字化で char 数が変わりうる文字（例: 'İ'）では
+    // text と lower の char 添字がずれうるが、コードのプレビューは実質 ASCII なので
+    // ここでは素朴に char 境界で対応付ける。
     let chars: Vec<char> = text.chars().collect();
     let lower_chars: Vec<char> = lower.chars().collect();
     let needle: Vec<char> = needle_lower.chars().collect();

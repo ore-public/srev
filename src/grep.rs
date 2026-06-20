@@ -17,6 +17,9 @@ struct Doc {
     rel: String,
     abs: PathBuf,
     lines: Vec<String>,
+    /// 各行の小文字版（大小無視検索用）。`open()` で一度だけ作り、毎キー入力での
+    /// 全行 `to_lowercase()` を避ける。`lines` と同じ長さ・対応。
+    lines_lower: Vec<String>,
 }
 
 /// 1 件のマッチ。
@@ -62,10 +65,15 @@ impl ProjectSearch {
             .sources
             .iter()
             .filter_map(|e| {
-                std::fs::read_to_string(&e.abs).ok().map(|content| Doc {
-                    rel: e.rel.clone(),
-                    abs: e.abs.clone(),
-                    lines: content.lines().map(|l| l.to_string()).collect(),
+                std::fs::read_to_string(&e.abs).ok().map(|content| {
+                    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                    let lines_lower = lines.iter().map(|l| l.to_lowercase()).collect();
+                    Doc {
+                        rel: e.rel.clone(),
+                        abs: e.abs.clone(),
+                        lines,
+                        lines_lower,
+                    }
                 })
             })
             .collect();
@@ -130,13 +138,14 @@ impl ProjectSearch {
         }
         let needle = self.query.to_lowercase();
         'outer: for doc in &self.docs {
-            for (i, line) in doc.lines.iter().enumerate() {
-                if line.to_lowercase().contains(&needle) {
+            // マッチ判定は小文字キャッシュ、プレビューは元の行から作る。
+            for (i, lower) in doc.lines_lower.iter().enumerate() {
+                if lower.contains(&needle) {
                     self.results.push(Hit {
                         abs: doc.abs.clone(),
                         rel: doc.rel.clone(),
                         line: i,
-                        preview: line.trim_start().chars().take(PREVIEW_CHARS).collect(),
+                        preview: doc.lines[i].trim_start().chars().take(PREVIEW_CHARS).collect(),
                     });
                     if self.results.len() >= MAX_RESULTS {
                         self.truncated = true;

@@ -245,6 +245,9 @@ pub struct OutlineRow {
 
 /// いま開いているファイルの状態一式。
 pub struct OpenFile {
+    /// 開いているファイルのパス。作業ツリーの実ファイル（Code/Diff）では**絶対パス**、
+    /// 履歴 blob（Commits/Branch ビュー）では**リポジトリルート相対**になる。表示・ジャンプ側は
+    /// この区別を前提に `root` で補正する（例: `jump_to_code_line`）。新規参照を足すときは注意。
     pub path: PathBuf,
     /// ハイライト済みの表示行。
     pub lines: Vec<Line<'static>>,
@@ -521,12 +524,11 @@ impl App {
 
     fn handle_events(&mut self) -> Result<()> {
         // キー入力を待ちつつ、定期的に起きてバックグラウンド作業を反映する。
-        if event::poll(std::time::Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.on_key(key);
-            }
+        if event::poll(std::time::Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            self.on_key(key);
         }
         Ok(())
     }
@@ -675,10 +677,8 @@ impl App {
         // diff モードでは「変更ファイル一覧」を操作する。
         if self.view_mode == ViewMode::Diff {
             match action {
-                Down => {
-                    if self.changed_selected + 1 < self.changed.len() {
-                        self.changed_selected += 1;
-                    }
+                Down if self.changed_selected + 1 < self.changed.len() => {
+                    self.changed_selected += 1;
                 }
                 Up => self.changed_selected = self.changed_selected.saturating_sub(1),
                 Activate | Right => {
@@ -2278,6 +2278,11 @@ impl App {
         self.grep = ProjectSearch::new(&self.all_files);
         self.index = ProjectIndex::new(&self.root);
         self.index.start(); // 索引もバックグラウンドで作り直す
+        // LSP も作り直す。pull/merge/checkout でディスク上の内容が変わっても、
+        // 既存サーバーは最初の didOpen 時点のテキストを保持し続ける（srev は
+        // 読み取り専用で didChange を送らない）ため、再生成して開き直させる。
+        // 旧 LspManager は Drop で各子プロセスを kill+wait する。
+        self.lsp = LspManager::new(&self.root);
 
         // コミット一覧も作り直す（次回 `c` で再構築。表示中なら即時）。
         self.commits_loaded = false;
