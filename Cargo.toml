@@ -1,6 +1,6 @@
 [package]
 name = "srev"
-version = "0.1.10"
+version = "1.0.0"
 edition = "2024"
 description = "A terminal code and diff viewer specialized for reading code"
 license = "MIT OR Apache-2.0"
@@ -33,6 +33,7 @@ tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-tags = "0.23"
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
+unicode-width = "0.2"
 
 [profile.release]
 opt-level = 3

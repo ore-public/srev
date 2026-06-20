@@ -10,6 +10,7 @@ mod lsp;
 mod tags;
 mod tree;
 mod ui;
+mod width;
 
 use std::path::PathBuf;
 

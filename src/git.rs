@@ -136,6 +136,14 @@ const MAX_COMMITS: usize = 2000;
 /// 離れた未変更行も省略しない（hunk の畳み込みをしない）。libgit2 は実質「全行」扱い。
 const FULL_FILE_CONTEXT: u32 = u32::MAX;
 
+/// blame の 1 行ぶん（その行を最後に変更したコミットの短縮 SHA・著者・日付）。
+#[derive(Clone)]
+pub struct BlameLine {
+    pub short: String,
+    pub author: String,
+    pub date: String,
+}
+
 pub struct GitInfo {
     repo: Repository,
     workdir: PathBuf,
@@ -210,6 +218,36 @@ impl GitInfo {
             .ok()?;
 
         Some(collect_diff_lines(&diff))
+    }
+
+    /// 作業ツリーのファイル（abs パス）の blame を**行順**で返す。各 raw 行に 1 要素対応。
+    /// 追跡外・非対応・エラー時は `None`。HEAD 時点の履歴を blame する（未コミット行は境界扱い）。
+    pub fn blame_file(&self, abs: &Path) -> Option<Vec<BlameLine>> {
+        let rel = abs.strip_prefix(&self.workdir).ok()?;
+        let blame = self.repo.blame_file(rel, None).ok()?;
+        let mut lines = Vec::new();
+        for i in 0..blame.len() {
+            let hunk = blame.get_index(i)?;
+            let full = hunk.final_commit_id().to_string();
+            let short = full.get(..7).unwrap_or(&full).to_string();
+            let sig = hunk.final_signature();
+            let author = sig
+                .as_ref()
+                .and_then(|s| s.name().ok())
+                .unwrap_or("?")
+                .to_string();
+            let date = fmt_date(sig.as_ref().map_or(0, |s| s.when().seconds()));
+            let entry = BlameLine {
+                short,
+                author,
+                date,
+            };
+            // hunk は最終ファイルの行範囲を表す。行数ぶん複製して行→コミットの対応にする。
+            for _ in 0..hunk.lines_in_hunk() {
+                lines.push(entry.clone());
+            }
+        }
+        Some(lines)
     }
 
     /// 現在のブランチ名（detached HEAD 等で取れなければ `None`）。
@@ -655,6 +693,36 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn blame_file_attributes_lines_to_commits() {
+        let dir = std::env::temp_dir().join(format!("srev_blame_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "tester"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        // 3 行目を別コミットで追加する。
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&dir, &["commit", "-qam", "add three"]);
+
+        let info = GitInfo::discover(&dir).expect("repo");
+        // workdir は正規化されうるので、strip_prefix が必ず通る workdir 起点の絶対パスを使う。
+        let blame = info
+            .blame_file(&info.workdir.join("a.txt"))
+            .expect("blame");
+        assert_eq!(blame.len(), 3, "1 ソース行に 1 要素");
+        assert!(blame.iter().all(|b| b.author == "tester"), "著者");
+        assert_eq!(blame[0].short, blame[1].short, "1-2 行目は同じコミット");
+        assert_ne!(blame[0].short, blame[2].short, "3 行目は別コミット");
+        assert_eq!(blame[0].date.len(), 10, "YYYY-MM-DD");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

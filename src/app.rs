@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,7 @@ enum FilterTarget {
 }
 
 /// git の変更ファイル 1 件。
+#[derive(Clone)]
 struct ChangedEntry {
     rel: String,
     abs: PathBuf,
@@ -208,6 +209,8 @@ pub struct ListRow {
     pub label: String,
     pub status: Option<FileStatus>,
     pub selected: bool,
+    /// レビュー既読マーク（Diff の変更一覧のみ Some。None ＝マーク非表示）。
+    pub reviewed: Option<bool>,
 }
 
 /// アウトライン（シンボル一覧）を何で抽出したか。Symbols ペインのタイトルに表示する。
@@ -269,6 +272,8 @@ pub struct OpenFile {
     pub outline_selected: usize,
     /// 各行の変更印（HEAD との差分、コードビューの gutter 用）。
     pub change_marks: Vec<crate::diffview::LineMark>,
+    /// blame（行ごとのコミット情報）。`gb` で遅延計算してキャッシュ。None＝未計算。
+    pub blame: Option<Vec<crate::git::BlameLine>>,
 }
 
 impl OpenFile {
@@ -374,6 +379,8 @@ pub struct App {
     /// git の変更ファイル一覧（diff モードのツリー）。
     changed: Vec<ChangedEntry>,
     changed_selected: usize,
+    /// レビュー既読の変更ファイル（abs パス。Diff ビュー専用、セッション内）。
+    reviewed: HashSet<PathBuf>,
     tree_filter: Option<FilterState>,
     outline_filter: Option<FilterState>,
     fuzzy: Fuzzy,
@@ -415,6 +422,10 @@ pub struct App {
     highlighter: CodeHighlighter,
     keymap: Keymap,
     pending_g: bool,
+    /// ヘルプ（キーマップ一覧）オーバーレイを表示中か（`?` でトグル）。
+    pub show_help: bool,
+    /// blame 列を表示中か（`gb` でトグル、コードビュー専用）。
+    pub show_blame: bool,
     should_quit: bool,
 }
 
@@ -463,6 +474,7 @@ impl App {
             all_files,
             changed,
             changed_selected: 0,
+            reviewed: HashSet::new(),
             tree_filter: None,
             outline_filter: None,
             fuzzy: Fuzzy::new(),
@@ -489,6 +501,8 @@ impl App {
             highlighter: CodeHighlighter::new(),
             keymap: Keymap::load(),
             pending_g: false,
+            show_help: false,
+            show_blame: false,
             should_quit: false,
         }
     }
@@ -538,6 +552,17 @@ impl App {
         self.flash = None;
         self.flash_at = None;
 
+        // ヘルプ表示中は最優先で吸収する（? / Esc / q で閉じる、他キーは無視）。
+        if self.show_help {
+            if matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc
+            ) {
+                self.show_help = false;
+            }
+            return;
+        }
+
         // モーダル（検索入力・あいまい検索・ペインフィルタ）は専用ハンドラへ。
         if self.search_input.is_some() {
             self.on_key_search_input(key);
@@ -577,6 +602,7 @@ impl App {
                     KeyCode::Char('g') => self.dispatch(Action::Top),
                     KeyCode::Char('d') => self.dispatch(Action::GotoDef),
                     KeyCode::Char('r') => self.dispatch(Action::GotoReferences),
+                    KeyCode::Char('b') => self.dispatch(Action::ToggleBlame),
                     _ => {}
                 }
             }
@@ -615,6 +641,9 @@ impl App {
             JumpBack => self.go_back(),
             JumpForward => self.go_forward(),
             ToggleJumps => self.show_jumps = !self.show_jumps,
+            ToggleHelp => self.show_help = !self.show_help,
+            ToggleReviewed => self.toggle_reviewed(),
+            ToggleBlame => self.toggle_blame(),
             ToggleCommits => self.toggle_commit_view(),
             ToggleBranchDiff => self.toggle_branch_diff(),
             NextChange => self.change_jump(true),
@@ -788,7 +817,7 @@ impl App {
             let max_h = open
                 .raw_lines
                 .iter()
-                .map(|l| l.chars().count())
+                .map(|l| crate::width::display_width(l))
                 .max()
                 .unwrap_or(0)
                 .saturating_sub(MIN_VISIBLE_COLS);
@@ -1123,6 +1152,7 @@ impl App {
                     label: f.labels[j].clone(),
                     status: f.statuses[j],
                     selected: offset + i == f.selected,
+                    reviewed: None,
                 })
                 .collect();
             return LeftPane::List {
@@ -1144,6 +1174,7 @@ impl App {
                     label: c.rel.clone(),
                     status: Some(c.status),
                     selected: i == self.changed_selected,
+                    reviewed: Some(self.reviewed.contains(&c.abs)),
                 })
                 .collect();
             return LeftPane::List {
@@ -1165,6 +1196,7 @@ impl App {
                     label: f.rel.clone(),
                     status: Some(f.status),
                     selected: i == self.branch_file_selected,
+                    reviewed: None,
                 })
                 .collect();
             return LeftPane::List {
@@ -1951,6 +1983,130 @@ impl App {
         self.pending_g
     }
 
+    /// ヘルプ・オーバーレイ用の (キー表記, 説明) 行を表示順で組み立てる。
+    /// keymap の現在束縛（ユーザ上書き反映）＋ g プレフィックスの固定束縛を連結する。
+    pub fn help_rows(&self) -> Vec<(String, String)> {
+        let bindings = self.keymap.bindings();
+        let mut rows = Vec::new();
+        for &action in Action::all() {
+            let mut keys: Vec<String> = bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(c, _)| c.display())
+                .collect();
+            if keys.is_empty() {
+                continue; // 既定束縛が無いアクション（g プレフィックス等）は下で別途。
+            }
+            keys.sort();
+            rows.push((keys.join(" / "), action.describe().to_string()));
+        }
+        // g プレフィックス（keymap 外・固定で変更不可）。
+        for (k, d) in [
+            ("gg", "Jump to top"),
+            ("gd", "Go to definition"),
+            ("gr", "List references"),
+            ("gb", "Toggle blame column"),
+        ] {
+            rows.push((k.to_string(), d.to_string()));
+        }
+        rows
+    }
+
+    /// レビュー既読/未読のトグル（Diff ビュー専用）。フォーカスで対象ファイルを決め、
+    /// 既読化したら次の未読ファイルへ前進して開く。未読へ戻す場合はその場に留まる。
+    fn toggle_reviewed(&mut self) {
+        if self.view_mode != ViewMode::Diff {
+            return; // 既読管理は差分ビュー専用（他モードでは no-op）。
+        }
+        let target = if self.focus == Focus::Content {
+            self.open.as_ref().map(|o| o.path.clone())
+        } else {
+            self.changed
+                .get(self.changed_selected)
+                .map(|c| c.abs.clone())
+        };
+        let Some(target) = target else { return };
+        if self.reviewed.remove(&target) {
+            return; // 既読 → 未読: 留まる。
+        }
+        self.reviewed.insert(target.clone());
+        self.advance_to_next_unreviewed(&target);
+    }
+
+    /// `from` の次にある未読の変更ファイルへ移動して開く。全て既読なら flash で知らせる。
+    fn advance_to_next_unreviewed(&mut self, from: &Path) {
+        let n = self.changed.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self
+            .changed
+            .iter()
+            .position(|c| c.abs == *from)
+            .unwrap_or(self.changed_selected);
+        for step in 1..=n {
+            let i = (cur + step) % n;
+            if !self.reviewed.contains(&self.changed[i].abs) {
+                self.changed_selected = i;
+                let path = self.changed[i].abs.clone();
+                self.open_file(&path);
+                self.focus = Focus::Content;
+                return;
+            }
+        }
+        self.flash = Some("all reviewed ✓".into());
+    }
+
+    /// Diff ビューのレビュー進捗 (既読数, 変更総数)。対象外（非 Diff・変更なし）なら None。
+    pub fn review_progress(&self) -> Option<(usize, usize)> {
+        if self.view_mode != ViewMode::Diff || self.changed.is_empty() {
+            return None;
+        }
+        let done = self
+            .changed
+            .iter()
+            .filter(|c| self.reviewed.contains(&c.abs))
+            .count();
+        Some((done, self.changed.len()))
+    }
+
+    /// blame 列の表示トグル（`gb`、コードビュー専用）。初回はその場で計算してキャッシュする。
+    fn toggle_blame(&mut self) {
+        if self.view_mode != ViewMode::Code {
+            self.flash = Some("blame: press d for code view".into());
+            return;
+        }
+        if self.show_blame {
+            self.show_blame = false;
+            return;
+        }
+        self.show_blame = true;
+        self.ensure_blame();
+        if self.open.as_ref().is_none_or(|o| o.blame.is_none()) {
+            // 計算できなかった（未追跡・非 git 等）→ オフへ戻して通知。
+            self.show_blame = false;
+            self.flash = Some("blame unavailable (untracked or non-git)".into());
+        }
+    }
+
+    /// blame 表示中かつコードビューなら、現在ファイルの blame を必要時に計算してキャッシュする。
+    /// `open_file` の末尾からも呼び、ファイル切替後も blame 列を維持する。
+    fn ensure_blame(&mut self) {
+        if !self.show_blame || self.view_mode != ViewMode::Code {
+            return;
+        }
+        if self.open.as_ref().is_none_or(|o| o.blame.is_some()) {
+            return; // 未オープン or 計算済み。
+        }
+        let Some(path) = self.open.as_ref().map(|o| o.path.clone()) else {
+            return;
+        };
+        let blame = self.git.as_ref().and_then(|g| g.blame_file(&path));
+        if let Some(open) = self.open.as_mut() {
+            open.blame = blame;
+        }
+    }
+
     /// 変更ファイル一覧の選択を、開いているファイルに同期する（差分モードの左ペイン）。
     fn sync_changed_to_open(&mut self) {
         let Some(path) = self.open.as_ref().map(|o| o.path.clone()) else {
@@ -2509,6 +2665,7 @@ impl App {
             outline_source: OutlineSource::TreeSitter,
             outline_selected: 0,
             change_marks,
+            blame: None,
         });
     }
 
@@ -2530,6 +2687,7 @@ impl App {
                 label: format!("{} {} {}", c.date, c.short, c.summary),
                 status: None,
                 selected: i == self.commit_selected,
+                reviewed: None,
             })
             .collect();
         (title, rows)
@@ -2549,6 +2707,7 @@ impl App {
                 label: f.rel.clone(),
                 status: Some(f.status),
                 selected: i == self.commit_file_selected,
+                reviewed: None,
             })
             .collect();
         (title, rows)
@@ -2652,6 +2811,7 @@ impl App {
             outline_source: OutlineSource::TreeSitter,
             outline_selected: 0,
             change_marks,
+            blame: None,
         });
     }
 
@@ -2715,6 +2875,7 @@ impl App {
             outline_source: OutlineSource::TreeSitter,
             outline_selected: 0,
             change_marks,
+            blame: None,
         });
         // LSP 対応言語なら、サーバーを（必要なら）起動して didOpen し、準備でき次第
         // documentSymbol でアウトラインを取り直す（tree-sitter 索引は即時の暫定表示）。
@@ -2732,6 +2893,8 @@ impl App {
         // 左ペイン（ツリー／変更ファイル一覧）の選択を開いたファイルに同期する。
         self.tree.reveal(path);
         self.sync_changed_to_open();
+        // blame 表示中なら、開いたファイルの blame も用意して列を維持する。
+        self.ensure_blame();
     }
 }
 
@@ -2883,6 +3046,7 @@ mod tests {
             outline_source: OutlineSource::TreeSitter,
             outline_selected: 0,
             change_marks: Vec::new(),
+            blame: None,
         }
     }
 
@@ -3234,6 +3398,99 @@ fn c() {}
             app.open_file(&path);
             assert_eq!(app.changed[app.changed_selected].abs, path);
         }
+    }
+
+    #[test]
+    fn review_marks_toggle_advance_and_progress() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone());
+        // 実在ファイルを変更ファイルに見立てる（advance の open_file がディスクを読むため）。
+        let files = ["Cargo.toml", "README.md", "src/app.rs"];
+        let entries: Vec<ChangedEntry> = files
+            .iter()
+            .map(|f| ChangedEntry {
+                rel: (*f).to_string(),
+                abs: root.join(f),
+                status: FileStatus::Modified,
+            })
+            .collect();
+        app.changed = entries.clone();
+        app.changed_selected = 0;
+        app.reviewed.clear();
+
+        // --- toggle ＋ 次の未読への前進 ---
+        // open_file は差分の無いファイルでは view_mode を Code に倒すので、毎回 Diff/Tree に戻す。
+        // 検証は reviewed 集合・changed_selected・flash（いずれもモード非依存）で行う。
+        app.view_mode = ViewMode::Diff;
+        app.focus = Focus::Tree;
+        app.toggle_reviewed(); // 0 を既読 → 次の未読(1)へ
+        assert!(app.reviewed.contains(&root.join("Cargo.toml")));
+        assert_eq!(app.changed_selected, 1);
+
+        app.view_mode = ViewMode::Diff;
+        app.focus = Focus::Tree;
+        app.toggle_reviewed(); // 1 を既読 → 2 へ
+        assert!(app.reviewed.contains(&root.join("README.md")));
+        assert_eq!(app.changed_selected, 2);
+
+        app.view_mode = ViewMode::Diff;
+        app.focus = Focus::Tree;
+        app.flash = None;
+        app.toggle_reviewed(); // 2 を既読 → 全既読、留まる
+        assert_eq!(app.reviewed.len(), 3);
+        assert_eq!(app.changed_selected, 2);
+        assert_eq!(app.flash.as_deref(), Some("all reviewed ✓"));
+
+        app.view_mode = ViewMode::Diff;
+        app.focus = Focus::Tree;
+        app.toggle_reviewed(); // 2 を未読へ戻す → 移動しない
+        assert!(!app.reviewed.contains(&root.join("src/app.rs")));
+        assert_eq!(app.changed_selected, 2);
+
+        // --- 進捗カウンタ（Diff のときだけ Some）---
+        app.view_mode = ViewMode::Diff;
+        app.changed = entries;
+        app.reviewed.clear();
+        assert_eq!(app.review_progress(), Some((0, 3)));
+        app.reviewed.insert(root.join("Cargo.toml"));
+        app.reviewed.insert(root.join("README.md"));
+        assert_eq!(app.review_progress(), Some((2, 3)));
+        app.view_mode = ViewMode::Code;
+        assert_eq!(app.review_progress(), None);
+    }
+
+    #[test]
+    fn blame_toggle_renders_short_sha_column() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone());
+        app.open_file(&root.join("Cargo.toml")); // 追跡ファイルをコードモードで開く
+        app.view_mode = ViewMode::Code;
+        app.focus = Focus::Content;
+        app.dispatch(Action::ToggleBlame); // `gb` 相当（show_blame on ＋ blame 計算）
+        if !app.show_blame {
+            return; // 非 git 環境ではスキップ
+        }
+        let Some(short) = app
+            .open
+            .as_ref()
+            .and_then(|o| o.blame.as_ref())
+            .and_then(|b| b.first())
+            .map(|b| b.short.clone())
+        else {
+            return;
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains(&short), "blame short sha {short} not rendered");
     }
 
     #[test]

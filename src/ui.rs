@@ -111,6 +111,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(branches) = &app.branches {
         render_branches(frame, frame.area(), branches);
     }
+    if app.show_help {
+        render_help(frame, frame.area(), app);
+    }
 
     // 端末カーソルをコード上の位置に表示。
     place_cursor(frame, content_area, app);
@@ -204,10 +207,20 @@ fn render_list_pane(
         .map(|row| {
             let label_style = if row.selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else if row.reviewed == Some(true) {
+                Style::default().fg(Color::DarkGray) // 既読は淡色
             } else {
                 Style::default()
             };
             let mut spans = Vec::new();
+            if let Some(reviewed) = row.reviewed {
+                let (glyph, color) = if reviewed {
+                    ("✓ ", Color::Green)
+                } else {
+                    ("○ ", Color::DarkGray)
+                };
+                spans.push(Span::styled(glyph, Style::default().fg(color)));
+            }
             if let Some(status) = row.status {
                 spans.push(Span::styled(
                     format!("{} ", status.letter()),
@@ -366,7 +379,15 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
         }
         ViewMode::Code => {
             let sel = focused.then(|| app.selection_region()).flatten();
-            render_code(frame, inner, open, focused, &app.search_query, sel.as_ref());
+            render_code(
+                frame,
+                inner,
+                open,
+                focused,
+                &app.search_query,
+                sel.as_ref(),
+                app.show_blame,
+            );
         }
     }
 }
@@ -392,6 +413,9 @@ fn change_marker(mark: LineMark) -> Span<'static> {
     Span::styled(ch, Style::default().fg(color))
 }
 
+/// blame 列の表示幅（セル）。`{短SHA} {日付} {著者}` を表示幅で切り詰め・右詰めする。
+const BLAME_W: usize = 30;
+
 fn render_code(
     frame: &mut Frame,
     area: Rect,
@@ -399,6 +423,7 @@ fn render_code(
     focused: bool,
     search: &str,
     sel: Option<&SelRegion>,
+    show_blame: bool,
 ) {
     // 右端 1 桁を変更オーバービュー・バーに割り当て、残りをコード本文にする。
     let (area, bar_area) = if area.width > 2 {
@@ -412,6 +437,8 @@ fn render_code(
     let total = open.lines.len();
     let num_width = total.to_string().len().max(3);
     let search_lc = (!search.is_empty()).then(|| search.to_lowercase());
+    // blame 列（表示中かつ計算済みのときだけ）。各行に 1 要素対応。
+    let blame = show_blame.then(|| open.blame.as_deref()).flatten();
 
     let lines: Vec<Line> = open
         .lines
@@ -434,9 +461,23 @@ fn render_code(
             let line_len = open.raw_lines.get(i).map_or(0, |l| l.chars().count());
             let line_sel = sel.and_then(|r| line_selection(r, i, line_len));
 
-            let mut spans = Vec::with_capacity(line.spans.len() + 2);
+            let mut spans = Vec::with_capacity(line.spans.len() + 3);
             spans.push(marker);
             spans.push(gutter);
+            // blame 列（表示中は常に固定幅を確保。未コミット行など対応が無い行は空白で詰める）。
+            if let Some(bl) = blame {
+                let cell = match bl.get(i) {
+                    Some(b) => {
+                        let content = format!("{} {} {}", b.short, b.date, b.author);
+                        crate::width::pad_display(&content, BLAME_W - 1)
+                    }
+                    None => " ".repeat(BLAME_W - 1),
+                };
+                spans.push(Span::styled(
+                    format!("{cell} "),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             // 選択範囲があれば該当セルに選択背景を載せる。
             if let Some((s, e, _)) = line_sel {
                 spans.extend(apply_selection(&line.spans, s, e));
@@ -663,7 +704,19 @@ fn place_cursor(frame: &mut Frame, content_area: Rect, app: &App) {
     let num_width = open.lines.len().to_string().len().max(3);
     // 変更印マーカー(1) + 行番号(num_width) + スペース(1)。
     let gutter = num_width as u16 + 2;
-    let x = inner_x + gutter + open.cursor_col.min(u16::MAX as usize) as u16;
+    // blame 列を表示中なら、そのぶんカーソルを右へずらす。
+    let blame_off = if app.show_blame && open.blame.is_some() {
+        BLAME_W as u16
+    } else {
+        0
+    };
+    // char インデックスのカーソル列を表示セル列へ（CJK 全角でズレないように）。
+    let col_cells = open
+        .raw_lines
+        .get(open.cursor_line)
+        .map(|l| crate::width::display_col(l, open.cursor_col))
+        .unwrap_or(open.cursor_col);
+    let x = inner_x + gutter + blame_off + col_cells.min(u16::MAX as usize) as u16;
     let y = inner_y + (open.cursor_line - open.scroll) as u16;
     let max_x = content_area.x + content_area.width.saturating_sub(2);
     frame.set_cursor_position((x.min(max_x), y));
@@ -672,6 +725,8 @@ fn place_cursor(frame: &mut Frame, content_area: Rect, app: &App) {
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     // 現在ブランチを右端のチップとして常時表示し、残りを以降の描画に使う。
     let area = render_branch_chip(frame, area, app);
+    // Diff ビューではレビュー進捗チップ（✓ n/m）をその左に出す。
+    let area = render_review_chip(frame, area, app);
     if let Some(buf) = &app.search_input {
         let line = Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
@@ -695,7 +750,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" g-", Style::default().fg(Color::Yellow)),
-                Span::styled("  g:top  d:def", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "  g:top  d:def  r:refs  b:blame",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ])),
             area,
         );
@@ -739,6 +797,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         vec![
             ("q", "quit"),
             ("Tab", "pane"),
+            ("space", "review"),
             ("] [", "Next/Prev File"),
             ("n/N", "change"),
             ("h/l", "scroll x"),
@@ -821,7 +880,59 @@ fn render_branch_chip(frame: &mut Frame, area: Rect, app: &App) -> Rect {
     left
 }
 
+/// ステータスバー右端（ブランチチップの左）にレビュー進捗チップ（`✓ n/m`）を描画し、
+/// 残り領域を返す。Diff ビューで変更ファイルがあるときだけ表示する。
+fn render_review_chip(frame: &mut Frame, area: Rect, app: &App) -> Rect {
+    let Some((done, total)) = app.review_progress() else {
+        return area;
+    };
+    let text = format!(" ✓ {done}/{total} ");
+    let w = text.chars().count() as u16;
+    if area.width <= w + 8 {
+        return area; // 狭いときはヒントを優先。
+    }
+    let style = if done == total {
+        Style::default().fg(Color::Black).bg(Color::Green)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Yellow)
+    };
+    let [left, chip] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(w)]).areas(area);
+    frame.render_widget(Paragraph::new(Line::styled(text, style)), chip);
+    left
+}
+
 /// 画面中央にあいまい検索オーバーレイを描画する。
+/// キーマップ一覧オーバーレイ（`?`）。2 段組で現在の束縛と g プレフィックスを表示する。
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(area, 86, 84);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" Keys — ? or Esc to close ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = app.help_rows();
+    let mid = rows.len().div_ceil(2);
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
+    for (col_area, slice) in [(left, &rows[..mid]), (right, &rows[mid..])] {
+        let lines: Vec<Line> = slice
+            .iter()
+            .map(|(keys, desc)| {
+                Line::from(vec![
+                    Span::styled(format!("{keys:>12}  "), Style::default().fg(Color::Cyan)),
+                    Span::raw(desc.clone()),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), col_area);
+    }
+}
+
 fn render_finder(frame: &mut Frame, area: Rect, finder: &Finder) {
     let popup = centered_rect(area, 70, 60);
     frame.render_widget(Clear, popup);
@@ -1223,5 +1334,15 @@ mod tests {
         }
         let text = render_to_string(&mut app);
         assert!(text.contains("Search in project"), "grep overlay missing");
+    }
+
+    #[test]
+    fn renders_help_overlay() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        app.show_help = true;
+        let text = render_to_string(&mut app);
+        assert!(text.contains("Keys"), "help overlay title missing");
+        assert!(text.contains("Quit"), "help overlay action missing");
+        assert!(text.contains("gd"), "help overlay g-prefix missing");
     }
 }

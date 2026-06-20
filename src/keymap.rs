@@ -74,6 +74,12 @@ pub enum Action {
     SwitchBranch,
     /// merge ピッカーを開く（origin fetch → 一覧 → 選択ブランチを現在ブランチへ merge）。
     MergeBranch,
+    /// レビュー既読/未読のトグル（差分ビューの変更ファイル単位）。
+    ToggleReviewed,
+    /// blame 列の表示/非表示を切替（`gb`。コードビュー）。
+    ToggleBlame,
+    /// ヘルプ（キーマップ一覧）オーバーレイの表示/非表示を切替。
+    ToggleHelp,
 }
 
 impl Action {
@@ -120,8 +126,111 @@ impl Action {
             "prev_change" | "change_prev" => Self::PrevChange,
             "switch_branch" | "branch" | "branches" => Self::SwitchBranch,
             "merge_branch" | "merge" => Self::MergeBranch,
+            "toggle_reviewed" | "review" | "reviewed" => Self::ToggleReviewed,
+            "toggle_blame" | "blame" => Self::ToggleBlame,
+            "help" | "toggle_help" => Self::ToggleHelp,
             _ => return None,
         })
+    }
+
+    /// ヘルプ表示順（カテゴリ順）。`describe` と対で全アクションを列挙する。
+    /// keymap に既定束縛のないもの（gg/gd/gr=Top/GotoDef/GotoReferences, gb=ToggleBlame）は
+    /// ヘルプ側で g プレフィックスとして別途明示するため、ここに含めても描画では拾われない。
+    pub fn all() -> &'static [Action] {
+        use Action::*;
+        &[
+            Quit,
+            ToggleHelp,
+            FocusNext,
+            ToggleDiff,
+            ToggleCommits,
+            ToggleBranchDiff,
+            ToggleSplit,
+            Down,
+            Up,
+            Left,
+            Right,
+            Activate,
+            Bottom,
+            HalfPageDown,
+            HalfPageUp,
+            WordForward,
+            WordBack,
+            LineStart,
+            LineEnd,
+            Find,
+            SearchNext,
+            SearchPrev,
+            NextChange,
+            PrevChange,
+            NextFile,
+            PrevFile,
+            VisualChar,
+            VisualLine,
+            Yank,
+            YankLocation,
+            CancelSelection,
+            FuzzyFind,
+            Grep,
+            JumpBack,
+            JumpForward,
+            ToggleJumps,
+            SwitchBranch,
+            MergeBranch,
+            ToggleReviewed,
+            Reload,
+        ]
+    }
+
+    /// ヘルプ表示用の短い説明（英語。README のアクション表が原典）。
+    pub fn describe(self) -> &'static str {
+        use Action::*;
+        match self {
+            Quit => "Quit",
+            FocusNext => "Cycle focus (tree → outline → content)",
+            Down => "Move down",
+            Up => "Move up",
+            Left => "Move left / collapse directory",
+            Right => "Move right / open",
+            Activate => "Open / confirm",
+            Top => "Jump to top (gg)",
+            Bottom => "Jump to bottom (G)",
+            HalfPageDown => "Half-page down",
+            HalfPageUp => "Half-page up",
+            WordForward => "Word forward",
+            WordBack => "Word back",
+            LineStart => "Line start",
+            LineEnd => "Line end",
+            ToggleDiff => "Toggle diff ⇄ code",
+            GotoDef => "Go to definition (gd)",
+            GotoReferences => "List references (gr)",
+            Find => "In-file search",
+            SearchNext => "Next match / next change",
+            SearchPrev => "Previous match / previous change",
+            VisualChar => "Visual mode (character)",
+            VisualLine => "Visual mode (line)",
+            Yank => "Copy selection",
+            YankLocation => "Copy location",
+            FuzzyFind => "Fuzzy file search",
+            Reload => "Pull + reload",
+            CancelSelection => "Cancel / close",
+            NextFile => "Next file",
+            PrevFile => "Previous file",
+            ToggleSplit => "Toggle unified ⇄ side-by-side",
+            Grep => "Project-wide content search",
+            JumpBack => "Jump history: back",
+            JumpForward => "Jump history: forward",
+            ToggleJumps => "Toggle jump-history pane",
+            ToggleCommits => "Toggle commit view",
+            ToggleBranchDiff => "Toggle PR diff view",
+            NextChange => "Next change block",
+            PrevChange => "Previous change block",
+            SwitchBranch => "Switch branch",
+            MergeBranch => "Merge a branch",
+            ToggleReviewed => "Mark reviewed / unreviewed (diff)",
+            ToggleBlame => "Toggle blame column (gb)",
+            ToggleHelp => "Toggle this help",
+        }
     }
 }
 
@@ -138,6 +247,29 @@ impl Chord {
             code: key.code,
             ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
         }
+    }
+
+    /// ヘルプ表示用の人間可読なキー表記（`parse` の逆。完全な往復ではなく表示優先）。
+    pub fn display(&self) -> String {
+        let key = match self.code {
+            KeyCode::Char(' ') => "space".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Tab => "tab".to_string(),
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::Esc => "esc".to_string(),
+            KeyCode::Up => "↑".to_string(),
+            KeyCode::Down => "↓".to_string(),
+            KeyCode::Left => "←".to_string(),
+            KeyCode::Right => "→".to_string(),
+            KeyCode::Home => "home".to_string(),
+            KeyCode::End => "end".to_string(),
+            KeyCode::PageUp => "pageup".to_string(),
+            KeyCode::PageDown => "pagedown".to_string(),
+            KeyCode::Backspace => "backspace".to_string(),
+            KeyCode::Delete => "del".to_string(),
+            other => format!("{other:?}"),
+        };
+        if self.ctrl { format!("ctrl-{key}") } else { key }
     }
 
     fn parse(s: &str) -> Option<Self> {
@@ -189,6 +321,11 @@ pub struct Keymap {
 impl Keymap {
     pub fn get(&self, chord: Chord) -> Option<Action> {
         self.map.get(&chord).copied()
+    }
+
+    /// 現在の束縛一覧（ヘルプ表示用）。順序は不定なので呼び出し側で整える。
+    pub fn bindings(&self) -> Vec<(Chord, Action)> {
+        self.map.iter().map(|(c, a)| (*c, *a)).collect()
     }
 
     /// 既定マップを読み込み、設定ファイルがあれば上書きする。
@@ -271,6 +408,9 @@ impl Keymap {
         add(ch('{'), PrevChange);
         add(ctrl('v'), SwitchBranch); // ブランチ切替（origin fetch → 一覧 → checkout）
         add(ch('m'), MergeBranch); // merge ピッカー（origin fetch → 一覧 → 現在ブランチへ merge）
+        add(ch(' '), ToggleReviewed); // 変更ファイルの既読/未読トグル（差分ビュー）
+        add(ch('?'), ToggleHelp); // キーマップ一覧オーバーレイ
+        // 注: blame は `gb`（g プレフィックス、keymap 外で pending_g が解決）。
 
         Self { map }
     }
@@ -358,6 +498,35 @@ mod tests {
                 ctrl: false
             }),
             None
+        );
+    }
+
+    #[test]
+    fn chord_display_and_describe_cover_all() {
+        let d = |code, ctrl| Chord { code, ctrl }.display();
+        assert_eq!(d(KeyCode::Char('q'), false), "q");
+        assert_eq!(d(KeyCode::Char('p'), true), "ctrl-p");
+        assert_eq!(d(KeyCode::Char(' '), false), "space");
+        assert_eq!(d(KeyCode::Tab, false), "tab");
+        // all() の各アクションに非空の説明がある（match の網羅性は型で保証）。
+        for &a in Action::all() {
+            assert!(!a.describe().is_empty(), "empty describe for {a:?}");
+        }
+        // 既定束縛: ? = ToggleHelp、space = ToggleReviewed。
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.get(Chord {
+                code: KeyCode::Char('?'),
+                ctrl: false
+            }),
+            Some(Action::ToggleHelp)
+        );
+        assert_eq!(
+            km.get(Chord {
+                code: KeyCode::Char(' '),
+                ctrl: false
+            }),
+            Some(Action::ToggleReviewed)
         );
     }
 }

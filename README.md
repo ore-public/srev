@@ -30,6 +30,9 @@ It keeps the controls simple so you can focus on reviewing diffs and browsing fu
 - **Branch switching** (`Ctrl-V`) — fetches `origin` first, then shows local and remote branches with **type-to-filter** fuzzy search; selecting one checks it out (via `git`, auto-creating a tracking branch for remotes) and reloads automatically. The **current branch** is always shown as a chip at the bottom-right of the status bar
 - File tree shows change status (`M`=modified / `A`=added / `D`=deleted / `?`=untracked). Dotfiles and `.gitignore`d files are listed too, shown **dimmed**; ignored directories (e.g. `target/`) appear but aren't descended into, and the `.git` directory is excluded
 - **Editor-style change gutter in code view** — added (green) / modified (blue) / deletion-above (red) vs HEAD; jump between change blocks with `}`/`{` (or `n`/`N` when no search is active), and a matching overview bar marks them on the right edge
+- **Review progress tracking** — in diff view, `space` marks the current changed file reviewed (✓) and jumps to the next unreviewed file; the status bar shows `✓ n/m`. Marks are per session (resuming across sessions is planned)
+- **Inline `git blame`** (`gb`) — toggle a per-line `commit · date · author` column in code view, read via libgit2 (no extra tooling). Untracked files and history views report that blame is unavailable
+- **Key help overlay** (`?`) — lists the currently active key bindings, reflecting any config overrides, plus the fixed `g`-prefixed jumps
 - Single binary. Builds on Linux / macOS / Windows
 
 ---
@@ -117,6 +120,8 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `]` / `[` | Open next / previous file (code mode = all files by path; diff mode = changed files) |
 | `(` / `)` | Jump history: go back / forward through jumps (`Ctrl-O` also goes back) |
 | `J` | Toggle the right-side jump-history pane (shown by default) |
+| `space` | (Diff view) mark the changed file reviewed / unreviewed, then advance to the next unreviewed |
+| `?` | Toggle the key-bindings help overlay |
 
 #### Tree (code mode) / Changed-file list (diff mode)
 
@@ -146,6 +151,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `Ctrl-d` / `Ctrl-u` | Half-page scroll |
 | `gd` | Jump to definition of word under cursor |
 | `gr` | List references (call sites) of word under cursor; `Enter` jumps (`↑`/`↓` or `Ctrl-n`/`Ctrl-p` to move, `Esc` to close) |
+| `gb` | Toggle the inline `git blame` column (commit · date · author) |
 | `v` / `V` | Start visual mode (character / line) |
 | `y` | Copy selection to clipboard |
 | `Y` | Copy location to clipboard (no selection = `path:line:col`; single-line = `path:line`; multi-line = `path:start-end`) |
@@ -154,7 +160,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `n` / `N` | Next / previous search match; with no active search, jump to next / previous change block |
 | `}` / `{` | Jump to next / previous change block (vs HEAD) |
 
-> The `g` prefix for `gg`, `gd` and `gr` is fixed and cannot be remapped in the config file.
+> The `g` prefix for `gg`, `gd`, `gr` and `gb` is fixed and cannot be remapped in the config file.
 
 #### Content pane — diff mode
 
@@ -251,6 +257,9 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `prev_change` | Jump to the previous change block |
 | `switch_branch` | Open the branch picker (fetch + checkout) |
 | `merge_branch` | Open the merge picker (fetch + merge a branch into the current one) |
+| `toggle_reviewed` | Mark the changed file reviewed / unreviewed (diff view) |
+| `toggle_blame` | Toggle the blame column (also `gb`) |
+| `toggle_help` | Toggle the key-bindings help overlay |
 
 Use `"none"` to disable a key binding.
 The `g` prefix for `gg` / `gd` cannot be remapped.
@@ -367,7 +376,7 @@ The pane title shows which source is active — `Symbols · tree-sitter` or
 - **No horizontal scroll** — long lines can be traversed with the cursor, but the view does not pan horizontally.
 - **Side-by-side view** gives each pane about half the screen width, so long lines clip sooner. Toggling with `s` re-shows a nearby position rather than an exact match.
 - **`gd` index builds in the background** — it starts on launch, so on large projects an early `gd` may briefly show "indexing…" (jumps are instant once ready).
-- **Wide characters and tabs** — cursor and selection highlight positions may be slightly off on lines containing full-width characters or tab characters.
+- **Tabs** — full-width (CJK) characters are now accounted for in cursor positioning, but lines containing **tab** characters can still be slightly off (the rendered tab width is terminal-dependent).
 - **In-file search highlights whole lines** — the exact match position within the line is not highlighted.
 - **Clipboard via arboard is for local use** — when connecting over SSH, clipboard content may not reach the remote terminal (consider OSC52 for SSH use cases).
 
