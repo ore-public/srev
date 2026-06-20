@@ -347,6 +347,11 @@ once it is ready (so PHP and other non-tree-sitter languages get an outline too)
 The pane title shows which source is active — `Symbols · tree-sitter` or
 `Symbols · LSP`.
 
+For **PHP** the outline is intentionally limited to **functions and methods** —
+closures, properties, constants, and class headers are omitted — so it reads as a
+clean function list. This filtering applies to the outline pane only; `gd` / `gr`
+still resolve every symbol.
+
 > Because the outline uses the server, opening a file of an LSP-configured
 > language now **starts that server in the background** (previously it started
 > on the first `gd` / `gr`). This also warms up `gd` / `gr`. Pure browsing of a

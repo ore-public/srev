@@ -1557,6 +1557,10 @@ impl App {
         if syms.is_empty() {
             return;
         }
+        // PHP は左下アウトラインを「呼び出せる名前付き定義」だけに絞る（関数/メソッド/
+        // コンストラクタを残し、Closure・変数・プロパティ・定数・クラス見出しを除外）。
+        // コードジャンプ(gd/gr)は別経路なので影響しない。
+        let functions_only = self.lsp.lang_id_for(&path).as_deref() == Some("php");
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -1565,6 +1569,7 @@ impl App {
         }
         open.outline = syms
             .into_iter()
+            .filter(|s| !functions_only || outline_keep_callable(&s.kind, &s.name))
             .map(|s| {
                 let col = open
                     .raw_lines
@@ -2898,6 +2903,15 @@ impl App {
     }
 }
 
+/// PHP アウトライン用フィルタ。左下 Symbols を「呼び出せる名前付き定義」だけにする。
+/// 関数・メソッド・コンストラクタを残し、Closure（intelephense は `{closure}`）・変数・
+/// プロパティ・定数・クラス見出し等を落とす。kind 文字列は lsp.rs `symbol_kind_str` 由来。
+fn outline_keep_callable(kind: &str, name: &str) -> bool {
+    matches!(kind, "function" | "method" | "constructor")
+        && !name.is_empty()
+        && !name.starts_with('{')
+}
+
 /// hunk 見出し行のうち、現在位置 `cur` の次（前）に来る行インデックス。
 fn next_hunk(hunk_rows: &[usize], cur: usize, forward: bool) -> Option<usize> {
     if forward {
@@ -3491,6 +3505,20 @@ fn c() {}
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains(&short), "blame short sha {short} not rendered");
+    }
+
+    #[test]
+    fn php_outline_keeps_only_named_callables() {
+        // 残す: 関数・メソッド・コンストラクタ。
+        assert!(outline_keep_callable("function", "doThing"));
+        assert!(outline_keep_callable("method", "handle"));
+        assert!(outline_keep_callable("constructor", "__construct"));
+        // 落とす: Closure・変数/プロパティ(symbol)・定数・クラス見出し・無名。
+        assert!(!outline_keep_callable("function", "{closure}"));
+        assert!(!outline_keep_callable("symbol", "$cb"));
+        assert!(!outline_keep_callable("constant", "VERSION"));
+        assert!(!outline_keep_callable("class", "Service"));
+        assert!(!outline_keep_callable("function", ""));
     }
 
     #[test]
