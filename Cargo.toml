@@ -1,6 +1,6 @@
 [package]
 name = "srev"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "A terminal code and diff viewer specialized for reading code"
 license = "MIT OR Apache-2.0"

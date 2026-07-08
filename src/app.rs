@@ -635,6 +635,18 @@ impl App {
                     Focus::Content => Focus::Tree,
                 };
             }
+            FocusTree => {
+                self.selection = None;
+                self.focus = Focus::Tree;
+            }
+            FocusOutline => {
+                self.selection = None;
+                self.focus = Focus::Outline;
+            }
+            FocusContent => {
+                self.selection = None;
+                self.focus = Focus::Content;
+            }
             ToggleDiff => self.toggle_view_mode(),
             FuzzyFind => self.finder.open(),
             Grep => self.grep.open(),
@@ -3412,6 +3424,18 @@ fn c() {}
             app.open_file(&path);
             assert_eq!(app.changed[app.changed_selected].abs, path);
         }
+    }
+
+    #[test]
+    fn focus_actions_jump_directly_to_pane() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        app.focus = Focus::Tree;
+        app.dispatch(Action::FocusContent);
+        assert_eq!(app.focus, Focus::Content);
+        app.dispatch(Action::FocusOutline);
+        assert_eq!(app.focus, Focus::Outline);
+        app.dispatch(Action::FocusTree);
+        assert_eq!(app.focus, Focus::Tree);
     }
 
     #[test]

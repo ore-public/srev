@@ -109,6 +109,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 |-----|--------|
 | `q` | Quit |
 | `Tab` | Cycle focus (tree → outline → content) |
+| `1` / `2` / `3` | Focus the files / symbols / code pane directly |
 | `d` | Toggle diff ⇄ code (line position preserved) |
 | `c` | Toggle the commit view (commits vs the default branch, or full log) |
 | `C` | Toggle the PR diff view (all files changed vs the default branch, three-dot diff) |
@@ -218,6 +219,9 @@ Add entries under `[keys]` as `"key" = "action"`.
 |-------------|-------------|
 | `quit` | Quit |
 | `focus_next` | Cycle focus |
+| `focus_tree` (`focus_files`) | Focus the files pane directly |
+| `focus_outline` (`focus_symbols`) | Focus the symbols pane directly |
+| `focus_content` (`focus_code`) | Focus the code pane directly |
 | `down` | Move down |
 | `up` | Move up |
 | `left` | Move left / collapse directory |

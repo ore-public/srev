@@ -49,6 +49,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // コミットビューでは左上=コミット一覧、左下=変更ファイル一覧。
     if app.view_mode == ViewMode::Commits {
         let (ctitle, crows) = app.commit_list_rows(tree_area.height.saturating_sub(2) as usize);
+        let ctitle = numbered(1, &ctitle);
         render_list_pane(
             frame,
             tree_area,
@@ -59,6 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         let (ftitle, frows) =
             app.commit_file_rows(outline_area.height.saturating_sub(2) as usize);
+        let ftitle = numbered(2, &ftitle);
         render_list_pane(
             frame,
             outline_area,
@@ -150,7 +152,8 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App, pane: &LeftPane) {
     match pane {
         // 階層ツリー（コードモード・フィルタ非アクティブ）。
         LeftPane::Tree => {
-            let block = pane_block("Files", focused);
+            let title = numbered(1, "Files");
+            let block = pane_block(&title, focused);
             let inner = block.inner(area);
             frame.render_widget(block, area);
 
@@ -171,7 +174,8 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App, pane: &LeftPane) {
         }
         // フラットリスト（変更ファイル / フィルタ結果）。
         LeftPane::List { title, query, rows } => {
-            render_list_pane(frame, area, title, query.as_deref(), rows, focused);
+            let title = numbered(1, title);
+            render_list_pane(frame, area, &title, query.as_deref(), rows, focused);
         }
     }
 }
@@ -242,6 +246,7 @@ fn render_outline(frame: &mut Frame, area: Rect, pane: &OutlinePane, focused: bo
         } => format!("Symbols · {s}"),
         _ => "Symbols".to_string(),
     };
+    let title = numbered(2, &title);
     let block = pane_block(&title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -349,6 +354,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &App) {
         }
         None => mode.to_string(),
     };
+    let title = numbered(3, &title);
     let block = pane_block(&title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -438,7 +444,7 @@ fn render_code(
     let num_width = total.to_string().len().max(3);
     let search_lc = (!search.is_empty()).then(|| search.to_lowercase());
     // blame 列（表示中かつ計算済みのときだけ）。各行に 1 要素対応。
-    let blame = show_blame.then(|| open.blame.as_deref()).flatten();
+    let blame = show_blame.then_some(open.blame.as_deref()).flatten();
 
     let lines: Vec<Line> = open
         .lines
@@ -1237,6 +1243,11 @@ fn render_jumps(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// ペインタイトルの先頭に番号ヒントを付与する（`1`/`2`/`3` キーでの直接ジャンプ用）。
+fn numbered(n: u8, title: &str) -> String {
+    format!("{n} {title}")
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'_> {

@@ -21,6 +21,12 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Action {
     Quit,
     FocusNext,
+    /// files ペイン（左上）へ直接フォーカス。
+    FocusTree,
+    /// symbols ペイン（左下）へ直接フォーカス。
+    FocusOutline,
+    /// code ペイン（右）へ直接フォーカス。
+    FocusContent,
     Down,
     Up,
     Left,
@@ -87,6 +93,9 @@ impl Action {
         Some(match name {
             "quit" => Self::Quit,
             "focus_next" | "focus" => Self::FocusNext,
+            "focus_tree" | "focus_files" => Self::FocusTree,
+            "focus_outline" | "focus_symbols" => Self::FocusOutline,
+            "focus_content" | "focus_code" => Self::FocusContent,
             "down" => Self::Down,
             "up" => Self::Up,
             "left" => Self::Left,
@@ -142,6 +151,9 @@ impl Action {
             Quit,
             ToggleHelp,
             FocusNext,
+            FocusTree,
+            FocusOutline,
+            FocusContent,
             ToggleDiff,
             ToggleCommits,
             ToggleBranchDiff,
@@ -188,6 +200,9 @@ impl Action {
         match self {
             Quit => "Quit",
             FocusNext => "Cycle focus (tree → outline → content)",
+            FocusTree => "Focus files pane",
+            FocusOutline => "Focus symbols pane",
+            FocusContent => "Focus code pane",
             Down => "Move down",
             Up => "Move up",
             Left => "Move left / collapse directory",
@@ -358,6 +373,9 @@ impl Keymap {
 
         add(ch('q'), Quit);
         add(key(KeyCode::Tab), FocusNext);
+        add(ch('1'), FocusTree);
+        add(ch('2'), FocusOutline);
+        add(ch('3'), FocusContent);
         add(ch('d'), ToggleDiff);
         add(ctrl('p'), FuzzyFind);
         add(ctrl('r'), Reload);
@@ -528,5 +546,19 @@ mod tests {
             }),
             Some(Action::ToggleReviewed)
         );
+    }
+
+    #[test]
+    fn number_keys_jump_to_panes() {
+        let km = Keymap::defaults();
+        let ch = |c: char| Chord {
+            code: KeyCode::Char(c),
+            ctrl: false,
+        };
+        assert_eq!(km.get(ch('1')), Some(Action::FocusTree));
+        assert_eq!(km.get(ch('2')), Some(Action::FocusOutline));
+        assert_eq!(km.get(ch('3')), Some(Action::FocusContent));
+        // 0 は vim 風の行頭移動のまま（競合させない）。
+        assert_eq!(km.get(ch('0')), Some(Action::LineStart));
     }
 }
