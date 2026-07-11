@@ -911,6 +911,7 @@ impl App {
             VisualLine => self.toggle_visual(true),
             Yank => self.yank_selection(),
             YankLocation => self.yank_location(),
+            YankPath => self.yank_path(),
             CancelSelection => self.selection = None,
             _ => {}
         }
@@ -2225,6 +2226,24 @@ impl App {
         self.selection = None;
     }
 
+    /// 開いているファイルの相対パス（起動ディレクトリ基準）をクリップボードへ。
+    fn yank_path(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let rel = open
+            .path
+            .strip_prefix(&self.root)
+            .unwrap_or(&open.path)
+            .to_string_lossy()
+            .into_owned();
+        self.flash = Some(if copy_to_clipboard(&rel) {
+            format!("yanked {rel}")
+        } else {
+            "clipboard error".into()
+        });
+    }
+
     /// 差分表示で次/前の変更ブロックへジャンプする。端では flash で知らせる。
     /// 全行表示で `@@` が 1 つに集約されても、変更の塊ごとに辿れる。
     fn hunk(&mut self, forward: bool) {
@@ -2701,7 +2720,7 @@ impl App {
             .skip(offset)
             .take(limit)
             .map(|(i, c)| ListRow {
-                label: format!("{} {} {}", c.date, c.short, c.summary),
+                label: format!("{} {} {} {} {}", c.date, c.time, c.short, c.author, c.summary),
                 status: None,
                 selected: i == self.commit_selected,
                 reviewed: None,

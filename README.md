@@ -156,6 +156,7 @@ Press `d` to toggle between code and diff, keeping the current line in view.
 | `v` / `V` | Start visual mode (character / line) |
 | `y` | Copy selection to clipboard |
 | `Y` | Copy location to clipboard (no selection = `path:line:col`; single-line = `path:line`; multi-line = `path:start-end`) |
+| `p` | Copy the open file's path (relative to the launch directory) |
 | `Esc` | Cancel selection |
 | `/` → type → `Enter` | In-file search |
 | `n` / `N` | Next / previous search match; with no active search, jump to next / previous change block |
@@ -245,6 +246,7 @@ Add entries under `[keys]` as `"key" = "action"`.
 | `visual_line` | Line visual mode |
 | `yank` | Copy selection |
 | `yank_location` | Copy location (line / line range when selecting) |
+| `yank_path` | Copy the open file's path (relative to the launch directory) |
 | `fuzzy_find` | Open file search overlay |
 | `reload` | Reload |
 | `cancel` | Cancel selection / close |

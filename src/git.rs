@@ -55,8 +55,12 @@ pub struct CommitInfo {
     pub short: String,
     /// 1 行目のサマリ。
     pub summary: String,
-    /// `YYYY-MM-DD`（コミット日時, UTC）。
+    /// `YYYY-MM-DD`（コミット日時, コミットのタイムゾーン）。
     pub date: String,
+    /// `HH:MM`（コミット日時, コミットのタイムゾーン）。
+    pub time: String,
+    /// コミット者（Author 名）。
+    pub author: String,
 }
 
 /// あるコミットで変更された 1 ファイル。
@@ -326,11 +330,16 @@ impl GitInfo {
             let Ok(commit) = self.repo.find_commit(oid) else {
                 continue;
             };
+            // コミットのタイムゾーンオフセットを反映したローカル時刻で表示する。
+            let t = commit.time();
+            let local = t.seconds() + i64::from(t.offset_minutes()) * 60;
             out.commits.push(CommitInfo {
                 id: oid,
                 short: oid.to_string().chars().take(7).collect(),
                 summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
-                date: fmt_date(commit.time().seconds()),
+                date: fmt_date(local),
+                time: fmt_time(local),
+                author: commit.author().name().unwrap_or("").to_string(),
             });
         }
         out
@@ -652,6 +661,12 @@ fn fmt_date(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// epoch 秒を時刻 `HH:MM` に。呼び出し側でタイムゾーン補正済みの秒を渡す。
+fn fmt_time(secs: i64) -> String {
+    let sod = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", sod / 3600, (sod % 3600) / 60)
 }
 
 fn collect_diff_lines(diff: &Diff) -> Vec<DiffLine> {

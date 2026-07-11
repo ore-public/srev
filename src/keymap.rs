@@ -51,6 +51,8 @@ pub enum Action {
     VisualLine,
     Yank,
     YankLocation,
+    /// 開いているファイルの相対パス（起動ディレクトリ基準）をコピー。
+    YankPath,
     FuzzyFind,
     Reload,
     CancelSelection,
@@ -119,6 +121,7 @@ impl Action {
             "visual_line" => Self::VisualLine,
             "yank" => Self::Yank,
             "yank_location" => Self::YankLocation,
+            "yank_path" | "copy_path" => Self::YankPath,
             "fuzzy_find" => Self::FuzzyFind,
             "reload" => Self::Reload,
             "cancel" | "cancel_selection" => Self::CancelSelection,
@@ -181,6 +184,7 @@ impl Action {
             VisualLine,
             Yank,
             YankLocation,
+            YankPath,
             CancelSelection,
             FuzzyFind,
             Grep,
@@ -226,6 +230,7 @@ impl Action {
             VisualLine => "Visual mode (line)",
             Yank => "Copy selection",
             YankLocation => "Copy location",
+            YankPath => "Copy file path",
             FuzzyFind => "Fuzzy file search",
             Reload => "Pull + reload",
             CancelSelection => "Cancel / close",
@@ -409,6 +414,7 @@ impl Keymap {
         add(ch('V'), VisualLine);
         add(ch('y'), Yank);
         add(ch('Y'), YankLocation);
+        add(ch('p'), YankPath); // 開いているファイルの相対パスをコピー
         add(key(KeyCode::Esc), CancelSelection);
         add(ch(']'), NextFile);
         add(ch('['), PrevFile);
